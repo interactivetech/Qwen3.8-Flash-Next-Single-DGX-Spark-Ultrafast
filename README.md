@@ -1,10 +1,16 @@
-# Qwen3.8-Flash-Next at 100+ tok/s on one DGX Spark
+<h1 align="center">Qwen3.8-Flash-Next at 100+ tok/s on one DGX Spark</h1>
 
-**~101 tok/s on English prose, ~133 tok/s on code, ~102 tok/s when the prompt holds an image, and ~250 tok/s across 4
-requests**, single DGX Spark, one `docker compose up`. That is about **2× the ~45–50 tok/s** most Qwen3.8-Flash-Next
-recipes reach on a Spark (vLLM/SGLang/TensorFold with NVFP4 + MTP).
+<p align="center">
+  <b>~101 tok/s prose · ~133 tok/s code · ~102 tok/s with images · ~250 tok/s across 4 requests</b><br>
+  About 2× a typical Flash-Next setup on the Spark. One <code>docker compose up</code>.
+</p>
 
-It runs [Hibana](https://github.com/sharar-project/hibana), Cornell's GB10 inference engine, in its `fast` profile,
+<p align="center">
+  <a href="#quickstart">Quickstart</a> · <a href="#speed">Speed</a> · <a href="#quality-and-limits">Quality</a> · <a href="https://github.com/dedene/Hibana-Qwen3.8-Flash-Next-DGX-Spark">Built on dedene's recipe</a>
+</p>
+
+Most Qwen3.8-Flash-Next recipes reach ~45–50 tok/s on a Spark (vLLM/SGLang/TensorFold with NVFP4 + MTP). This one runs
+[Hibana](https://github.com/sharar-project/hibana), Cornell's GB10 inference engine, in its `fast` profile,
 and adds **image input** for Flash-Next, which upstream Hibana does not load. OpenAI- and Anthropic-compatible API on
 port 8888, thinking and tool calls included.
 
@@ -13,16 +19,19 @@ port 8888, thinking and tool calls included.
 > repo adds two Hibana patches for images and ships the `fast` profile by default. If you only need text, dedene's
 > recipe with `PROFILE=fast` gives the same text speed.
 
-## Speed
-
 *Real time, no speed-up: this recipe doing an agentic coding task in DeepSeek Harness (reasoning effort Low, thinking expanded). Jump cuts skip pauses while tool calls run. [MP4](media/dsh-agentic-demo.mp4)*
 
 [![This recipe running an agentic coding task in DeepSeek Harness: reasoning, tool calls and code streaming in real time](media/dsh-agentic-demo.gif)](media/dsh-agentic-demo.mp4)
+
+## Speed
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="media/speed-chart-dark.png">
   <img alt="Bar chart: this recipe streams 101.3 tok/s on English prose vs 46.6 for a typical recipe, 133.3 vs 58.3 on code, 101.8 on prose about an image, and 252.9 vs 97.3 total with 4 requests at once" src="media/speed-chart-light.png">
 </picture>
+
+<details>
+<summary><b>Exact numbers</b></summary>
 
 | tok/s, one DGX Spark | Typical recipe (TensorFold, NVFP4 + MTP) | Hibana `exact` | **This recipe** (Hibana `fast` + images) |
 |---|---:|---:|---:|
@@ -34,6 +43,8 @@ port 8888, thinking and tool calls included.
 | Code, sampled (temperature 1.0), 1 request | | | 114.3 |
 | Prose about an image, sampled, 1 request | | | 84.5 |
 | 4 requests, sampled, total | | | 204.2 |
+
+</details>
 
 Decode speed, timed from the first output token, thinking on (the default). Temperature 0 unless marked, 512 output
 tokens (1,024 for sampled rows), median of 3 runs (5 for single sampled rows). This recipe's column was measured
