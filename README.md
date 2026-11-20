@@ -1,4 +1,4 @@
-# Qwen3.8-Flash-Next at 100+ tok/s with image input on one DGX Spark
+# Qwen3.8-Flash-Next at 100+ tok/s on one DGX Spark
 
 **~101 tok/s on English prose, ~133 tok/s on code, ~102 tok/s when the prompt holds an image, and ~250 tok/s across 4
 requests**, single DGX Spark, one `docker compose up`. That is about **2× the ~45–50 tok/s** most Qwen3.8-Flash-Next
