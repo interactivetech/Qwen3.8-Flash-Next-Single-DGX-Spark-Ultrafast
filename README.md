@@ -15,6 +15,10 @@ port 8888, thinking and tool calls included.
 
 ## Speed
 
+[![This recipe running an agentic coding task in DeepSeek Harness: reasoning, tool calls and code streaming in real time](media/dsh-agentic-demo.gif)](media/dsh-agentic-demo.mp4)
+
+*Real time, no speed-up: this recipe doing an agentic coding task in DeepSeek Harness (reasoning effort Low, thinking expanded). Jump cuts skip pauses while tool calls run. [MP4](media/dsh-agentic-demo.mp4)*
+
 | tok/s, one DGX Spark | Typical recipe (TensorFold, NVFP4 + MTP) | Hibana `exact` | **This recipe** (Hibana `fast` + images) |
 |---|---:|---:|---:|
 | English prose, 1 request | 46.6 | 45.2 | **101.3** |
