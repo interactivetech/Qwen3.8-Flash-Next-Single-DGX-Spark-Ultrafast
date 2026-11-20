@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="#quickstart">Quickstart</a> · <a href="#speed">Speed</a> · <a href="#quality-and-limits">Quality</a> · <a href="https://github.com/dedene/Hibana-Qwen3.8-Flash-Next-DGX-Spark">Built on dedene's recipe</a>
+  <a href="#quickstart">Quickstart</a> · <a href="#speed">Speed</a> · <a href="#quality-and-limits">Quality</a> · <a href="docs/optimization-notes.md">Optimization notes</a> · <a href="https://github.com/dedene/Hibana-Qwen3.8-Flash-Next-DGX-Spark">Built on dedene's recipe</a>
 </p>
 
 Most Qwen3.8-Flash-Next recipes reach ~45–50 tok/s on a Spark (vLLM/SGLang/TensorFold with NVFP4 + MTP). This one runs
@@ -167,6 +167,7 @@ Put overrides in `.env` (see `.env.example`).
 - `tools/download.sh`: Hibana's own preflight fetches the pinned checkpoint and 3-bit copies for every profile.
 - `tools/serve.sh`: maps the settings above to `hibana serve flashnext`.
 - `tools/check.py`: standard library only. `--needle 32000 131072` adds long-context retrieval.
+- `docs/optimization-notes.md`: every change we measured, what we kept, what we rejected and why, with the numbers.
 
 ## Credits
 
