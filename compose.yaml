@@ -1,0 +1,81 @@
+# Qwen3.8-Flash-Next with image input on one DGX Spark with Hibana: `docker compose up -d --wait` builds the engine
+# image, downloads the pinned checkpoint and its 3-bit copies (about 186 GB, first run only) and returns once the
+# OpenAI- and Anthropic-compatible API on :8888 answers. Settings: .env.example.
+name: hibana-flashnext-vision
+
+x-image: &image
+  image: ${HIBANA_IMAGE:-hibana-flashnext-vision:d474b74d-v1}
+  build:
+    context: .
+    args:
+      HIBANA_COMMIT: ${HIBANA_COMMIT:-d474b74d5a892b2cd1cc8fc50cb17946e2a539bb}
+
+# Hibana reads its pins from the source (hibana/model/flashnext/config.py), these paths from the environment.
+x-paths: &paths
+  HIBANA_HF_CACHE: /hf
+  HIBANA_RESULTS: /data
+  HF_TOKEN: ${HF_TOKEN:-}
+
+services:
+  # One-shot: the checkpoint into the shared HF cache, the 3-bit copies into DATA_DIR. A no-op once present.
+  download:
+    <<: *image
+    entrypoint: ["bash", "/download.sh"]
+    environment:
+      <<: *paths
+      PROPOSER: ${PROPOSER:-mtp}
+    volumes:
+      - ./tools/download.sh:/download.sh:ro
+      - ${HF_CACHE:-~/.cache/huggingface}:/hf
+      - ${DATA_DIR:-~/.cache/hibana-flashnext}:/data
+    healthcheck:
+      disable: true
+
+  hibana:
+    <<: *image
+    entrypoint: ["bash", "/serve.sh"]
+    container_name: hibana-flashnext-vision
+    restart: ${RESTART:-no}
+    depends_on:
+      download:
+        condition: service_completed_successfully
+    gpus: all
+    network_mode: host
+    ipc: host
+    # tini as PID 1, so `docker compose down` reaches Hibana's SIGTERM drain.
+    init: true
+    stop_grace_period: 60s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+      <<: *paths
+      HF_HUB_OFFLINE: "1"
+      PROFILE: ${PROFILE:-fast}
+      PROPOSER: ${PROPOSER:-mtp}
+      SPEC: ${SPEC:-}
+      PARALLEL: ${PARALLEL:-}
+      CONTEXT: ${CONTEXT:-262144}
+      SSD: ${SSD:-on}
+      SSD_GIB: ${SSD_GIB:-100}
+      HOST_FLOOR_GIB: ${HOST_FLOOR_GIB:-12}
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-8888}
+      # Image input (patches 0002 and 0003): 1 loads the vision tower (0.84 GiB), 0 serves text only.
+      HIBANA_VISION: ${VISION:-1}
+      # Draft head reads only the 131,072 most common vocabulary rows: +3-10% decode on English and code. The model
+      # still verifies against the full vocabulary. Set 0 (full vocabulary) for mostly non-English text.
+      HIBANA_DRAFT_VOCAB: ${DRAFT_VOCAB:-131072}
+    volumes:
+      - ./tools/serve.sh:/serve.sh:ro
+      - ${HF_CACHE:-~/.cache/huggingface}:/hf:ro
+      - ${DATA_DIR:-~/.cache/hibana-flashnext}:/data
+      # First-use GB10 kernel builds (torch extensions, FlashInfer JIT, Triton): about 2.5 min once.
+      - ${KERNEL_CACHE:-~/.cache/hibana-flashnext/kernels}:/root/.cache
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:${PORT:-8888}/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30m
+      start_interval: 10s

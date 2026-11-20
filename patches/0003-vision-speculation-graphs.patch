@@ -1,0 +1,646 @@
+diff -ruN a/hibana/engine/config.py b/hibana/engine/config.py
+--- a/hibana/engine/config.py
++++ b/hibana/engine/config.py
+@@ -105,6 +105,8 @@
+     flashnext_experts: str = "w3"             # HIBANA_FLASHNEXT_EXPERTS: w3 (the W3 checkpoint's 3-bit routed experts when it carries them) | nvfp4
+     bolt_experts: str = "b12x"                # HIBANA_BOLT_EXPERTS: b12x fused MoE (BF16 activations) | fp8 grouped native IQ2 | bf16 Triton weight-only
+     vision: bool = False                      # HIBANA_VISION: load the checkpoint's vision encoder for image input (Nemotron Super and Bolt; about 1.7 GiB)
++    vision_spec: bool = True                  # HIBANA_VISION_SPEC: image conversations may speculate (MTP + verify; 0: non-speculative decode)
++    vision_graphs: bool = True                # HIBANA_VISION_GRAPHS: image rows run the captured graphs with M-RoPE rotary inputs (0: eager image rows)
+     # --- speculation
+     spec: str | None = None                   # HIBANA_SPEC as given ("auto"/unset: the proposer's default depth)
+     spec_depths: str | None = None            # HIBANA_SPEC_DEPTHS: verify depth per batch bucket, "8:1,16:0" (0: plain decode; unset: HIBANA_SPEC everywhere)
+@@ -189,6 +191,8 @@
+             flashnext_experts=_str(e, "HIBANA_FLASHNEXT_EXPERTS", "w3"),
+             bolt_experts=_str(e, "HIBANA_BOLT_EXPERTS", "b12x"),
+             vision=_flag(e, "HIBANA_VISION"),
++            vision_spec=_flag(e, "HIBANA_VISION_SPEC", True),
++            vision_graphs=_flag(e, "HIBANA_VISION_GRAPHS", True),
+             spec=_str(e, "HIBANA_SPEC"),
+             spec_depths=_str(e, "HIBANA_SPEC_DEPTHS"),
+             spec_step_cost=float(_str(e, "HIBANA_SPEC_STEP_COST") or 0.0),
+diff -ruN a/hibana/engine/context.py b/hibana/engine/context.py
+--- a/hibana/engine/context.py
++++ b/hibana/engine/context.py
+@@ -77,6 +77,11 @@
+     @property
+     def batched(self) -> bool:
+         return self.cu_seqlens is not None
++    # Graph replays of image rows (model/flashnext/vision_positions.rope_rows): the rotary position of each row (int64 [rows]),
++    # and the indexer's group-key position argument (see rope_rows). Physical `positions` still address the KV, the masks and
++    # the groups. None: the physical positions (every existing caller).
++    rope_positions: torch.Tensor | None = None
++    rope_compress: torch.Tensor | None = None
+     # decode
+     slots: torch.Tensor | None = None  # [B] int32 committed state slot per row
+     out_pages: torch.Tensor | None = None  # [B] int32 KV write location for the new token
+@@ -92,6 +97,14 @@
+     # sparse-attention bookkeeping, model/flashnext/extras.py). None for a model without any.
+     extras: object = None
+ 
++    def rope(self) -> torch.Tensor:
++        """The rotary position of each row: the graph's `rope_positions` when set, else the physical positions."""
++        return self.positions if self.rope_positions is None else self.rope_positions
++
++    def compress_pos(self) -> torch.Tensor:
++        """The indexer's group-key position argument per row (`rope_compress`), else the physical positions."""
++        return self.positions if self.rope_compress is None else self.rope_compress
++
+     @property
+     def query_start_loc(self) -> torch.Tensor:
+         return torch.tensor([0, self.seq_len], dtype=torch.int32, device=self.positions.device)
+diff -ruN a/hibana/engine/executor.py b/hibana/engine/executor.py
+--- a/hibana/engine/executor.py
++++ b/hibana/engine/executor.py
+@@ -63,6 +63,8 @@
+         self.model = model
+         self.device = model.device
+         self.extras = model.forward_extras()  # what the model's forwards need beyond the context (None for the 27B)
++        self.vision_spec = current().vision_spec
++        self.vision_graphs = current().vision_graphs
+         self.vision = getattr(model, "vision", None)  # optional: engine/contracts.VisionEncoder
+         self.images = Encoder(self.vision, self.device) if self.vision is not None else None
+         self.ledger = Ledger(target=self.target)
+@@ -549,9 +551,22 @@
+         """Prompt ids as the model reads them: an image's placeholder ids become the image token (engine/media.py)."""
+         return text_ids(ids, self.vision.image_token) if req.media else ids
+ 
++    vision_spec = True  # HIBANA_VISION_SPEC (engine/config.py); set from the config in __init__
++    vision_graphs = True  # HIBANA_VISION_GRAPHS (engine/config.py); set from the config in __init__
++
+     def _qwen_image(self, req: Request) -> bool:
+         return bool(req.media and getattr(self.vision, "uses_mrope", False))
+ 
++    def _image_graphs(self, reqs) -> bool:
++        """The batch's image rows may run the graphs (HIBANA_VISION_GRAPHS, and every image request has one rotary position
++        per row: model/flashnext/vision_positions.graphable). False: the image rows run eager."""
++        from hibana.model.flashnext.vision_positions import graphable
++        return self.vision_graphs and all(graphable(r) for r in reqs if self._qwen_image(r))
++
++    def _image_spec_off(self, req: Request) -> bool:
++        """An image request that decodes without speculation: only with HIBANA_VISION_SPEC=0."""
++        return self._qwen_image(req) and not self.vision_spec
++
+     def prefill_ready(self, req: Request, n: int, wait: bool) -> int:
+         """How many of the next `n` prompt tokens of `req` can prefill now: up to an image whose encode is still running
+         (`media.Encoder.ready`), or all `n` with `wait`. The scheduler asks before each chunk."""
+@@ -715,8 +730,8 @@
+             self._chunk_checkpoint(req, req.prefill_pos + n_new)
+         if self.spec is not None:
+             for i, (req, n_new) in enumerate(chunks):
+-                if self._qwen_image(req):
+-                    continue  # prototype: multimodal drafts require separate M-RoPE integration
++                if self._image_spec_off(req):
++                    continue  # HIBANA_VISION_SPEC=0: the prototype's non-speculative image decode
+                 rows = {"norm": out["norm"][cu[i]:cu[i + 1]]}
+                 if "features" in out:
+                     rows["features"] = {lid: value[cu[i]:cu[i + 1]] for lid, value in out["features"].items()}
+@@ -733,7 +748,7 @@
+             req.prefill_seconds += elapsed
+         for i, tok in zip(finishing, tokens or []):
+             chunks[i][0].push(int(tok))
+-            if self.spec is not None and not self._qwen_image(chunks[i][0]):
++            if self.spec is not None and not self._image_spec_off(chunks[i][0]):
+                 self.spec.start(chunks[i][0], int(tok))
+ 
+     def _finish_single_prefill(self, batch, out):
+@@ -743,14 +758,14 @@
+         new_ids = self._model_ids(req, req.prefill_ids[start:end])
+         self.state.commit_prefill(req, end)
+         self._chunk_checkpoint(req, end)
+-        if self.spec is not None and not self._qwen_image(req):
++        if self.spec is not None and not self._image_spec_off(req):
+             self.spec.ingest_prefill(req, new_ids, start, out)
+         self.state.checkpoint(req, end)  # the drafter ingested the chunk: its snapshots go in, the lock moves
+         token = None
+         if end == n:
+             logits = self.model.logits(out["norm"][-1:])
+             token = int(self.sampler.sample(logits, [req.params], [req.generator], sample_masks([req], logits.shape[-1])).item())
+-            if self.spec is not None and not self._qwen_image(req):
++            if self.spec is not None and not self._image_spec_off(req):
+                 self.spec.start(req, token)
+         if self.timing:
+             torch.cuda.synchronize()
+@@ -827,7 +842,9 @@
+         With speculative decoding on, greedy requests go through spec rounds
+         and sampled ones through the plain step."""
+         assert 0 < len(reqs) <= self.max_batch
+-        spec_reqs = [r for r in reqs if self.spec is not None and not self._qwen_image(r) and self.spec.ready(r)
++        image = any(self._qwen_image(r) for r in reqs)  # an image in the batch: eager unless the graphs take its rope rows
++        image_graphs = not image or self._image_graphs(reqs)
++        spec_reqs = [r for r in reqs if self.spec is not None and not self._image_spec_off(r) and self.spec.ready(r)
+                      and (r.params.greedy or not self.spec.proposer.requirements.greedy_only)]
+         if spec_reqs and self.spec.depth_policy.choose(reqs) == 0:
+             spec_reqs = []  # a wide batch at depth 0 (the throughput profile): plain decode; the proposer still follows
+@@ -837,7 +854,7 @@
+         # advances so memory pressure cannot replay a partly completed round.
+         self.state.ensure_pages(need)
+         if spec_reqs:
+-            self.spec.round(spec_reqs)
++            self.spec.round(spec_reqs, eager=image and self.vision_spec and not image_graphs)
+         if not plain:
+             return [r.output_ids[-1] for r in reqs]
+         reqs = plain
+@@ -845,7 +862,9 @@
+         step_pages = [self.state.step_pages(r) for r in reqs]
+         seqs = [(r.context_len - 1, 1, pages) for r, pages in zip(reqs, step_pages)]
+         variant = self.variant(seqs)
+-        if self.use_graphs and self.graphs is not None and variant in self.graphs.variants and not any(self._qwen_image(r) for r in reqs):
++        if self.use_graphs and self.graphs is not None and variant in self.graphs.variants and image_graphs:
++            from hibana.model.flashnext.vision_positions import graph_rows
++            rope, compress = graph_rows([(r, r.context_len - 1) for r in reqs])  # None for a text-only batch
+             result = self.graphs.run(
+                 [r.output_ids[-1] for r in reqs],
+                 [r.context_len - 1 for r in reqs],
+@@ -855,6 +874,8 @@
+                 return_features=self.spec is not None,
+                 side=(reqs, seqs),
+                 variant=variant,
++                rope=rope,
++                compress=compress,
+             )
+             if self.spec is not None:
+                 logits, out = result
+@@ -882,7 +903,7 @@
+         for i, (r, tok) in enumerate(zip(reqs, next_tokens)):
+             pending = r.output_ids[-1]
+             self.state.commit(r, 1)
+-            if self.spec is not None and not self._qwen_image(r):
++            if self.spec is not None and not self._image_spec_off(r):
+                 rows = {"norm": out["norm"][i:i + 1]}
+                 if "features" in out:
+                     rows["features"] = {lid: value[i:i + 1] for lid, value in out["features"].items()}
+diff -ruN a/hibana/engine/graphs.py b/hibana/engine/graphs.py
+--- a/hibana/engine/graphs.py
++++ b/hibana/engine/graphs.py
+@@ -57,9 +57,13 @@
+ 
+     def _make_static(self, b: int) -> dict:
+         d = self.device
++        pos3 = torch.zeros(3, b, dtype=torch.int64, device=d)  # physical positions, rope positions, compress positions (rope_rows)
+         return {
+             "tokens": torch.zeros(b, dtype=torch.int64, device=d),
+-            "positions": torch.zeros(b, dtype=torch.int64, device=d),
++            "pos3": pos3,
++            "positions": pos3[0],
++            "rope": pos3[1],
++            "compress": pos3[2],
+             "slots": torch.zeros(b, dtype=torch.int32, device=d),
+             "out_pages": torch.zeros(b, dtype=torch.int32, device=d),
+             "indptr": torch.zeros(b + 1, dtype=torch.int32, device=d),
+@@ -86,6 +90,8 @@
+             kv_pool=self.ex.kv_pool,
+             state_pool=self.ex.state_pool,
+             positions=st["positions"],
++            rope_positions=st["rope"],
++            rope_compress=st["compress"],
+             slots=st["slots"],
+             out_pages=st["out_pages"],
+             decode_wrapper=self._wrappers[b],
+@@ -131,9 +137,11 @@
+         return graph_set.pick(self.sizes, b)
+ 
+     def run(self, tokens: list[int], positions: list[int], slots: list[int], out_pages: torch.Tensor, pages: list[torch.Tensor], *, return_features=False,
+-            side=None, variant: str = "dense"):
++            side=None, variant: str = "dense", rope: list[int] | None = None, compress: list[int] | None = None):
+         """Returns logits [b, V] for the b real rows; `side` is (requests, seqs) for the model's side inputs,
+-        `variant` the graph to replay ("selecting": some row past Flash-Next's indexer budget)."""
++        `variant` the graph to replay ("selecting": some row past Flash-Next's indexer budget). `rope` and `compress`:
++        each row's rotary position and group-key position (model/flashnext/vision_positions.rope_rows); None: the
++        physical positions (text)."""
+         b = len(tokens)
+         size = self.pick(b)
+         st = self._static[size]
+@@ -141,7 +149,9 @@
+         if st["side"] is not None:
+             self.ex.extras.fill(st["side"], side[0], None, side[1], b)
+         st["tokens"].copy_(torch.tensor(tokens + [0] * pad, dtype=torch.int64))
+-        st["positions"].copy_(torch.tensor(positions + [0] * pad, dtype=torch.int64))
++        rope = positions if rope is None else rope
++        compress = positions if compress is None else compress
++        st["pos3"].copy_(torch.tensor([p + [0] * pad for p in (positions, rope, compress)], dtype=torch.int64))
+         st["slots"].copy_(torch.tensor(slots + [0] * pad, dtype=torch.int32))
+         st["out_pages"][:b].copy_(out_pages)
+         if pad:
+diff -ruN a/hibana/engine/spec_graphs.py b/hibana/engine/spec_graphs.py
+--- a/hibana/engine/spec_graphs.py
++++ b/hibana/engine/spec_graphs.py
+@@ -40,6 +40,18 @@
+     return st["qo_indptr"], st["kv_indptr"], st["kv_indices"], splits
+ 
+ 
++def _rope_inputs(st: dict, n: int, positions: torch.Tensor, rope: list[int] | None, compress: list[int] | None) -> None:
++    """The first n rows of a graph's position inputs: physical positions (the device tensor), then the rope and compress
++    rows (host lists from vision_positions.rope_rows; None: the physical positions, text)."""
++    st["pos3"][0, :n].copy_(positions)
++    if rope is None or compress is None:  # text: the physical positions (on the device, no upload)
++        if (rope is None) != (compress is None):
++            raise ValueError("rope and compress positions come together")
++        st["pos3"][1:, :n].copy_(positions)
++        return
++    st["pos3"][1:, :n].copy_(torch.tensor([rope, compress], dtype=torch.int64))
++
++
+ class VerifyGraphs:
+     def __init__(self, spec, depth=None, sizes=None):
+         self.spec = spec
+@@ -58,9 +70,13 @@
+ 
+     def _static(self, b: int) -> dict:
+         d, s = self.device, self.s_len
++        pos3 = torch.zeros(3, b * s, dtype=torch.int64, device=d)  # physical, rope, compress positions (vision_positions.rope_rows)
+         st = {
+             "tokens": torch.zeros(b * s, dtype=torch.int64, device=d),
+-            "positions": torch.zeros(b * s, dtype=torch.int64, device=d),
++            "pos3": pos3,
++            "positions": pos3[0],
++            "rope": pos3[1],
++            "compress": pos3[2],
+             "pages": torch.zeros(b * s, dtype=torch.int32, device=d),
+             "slots": torch.zeros(b, dtype=torch.int32, device=d),
+             "qo_indptr": torch.arange(0, b * s + 1, s, dtype=torch.int32, device=d),
+@@ -73,6 +89,7 @@
+         st["ctx"] = ForwardContext(
+             feature_request=self.spec.proposer.requirements.features,
+             mode="verify", kv_pool=self.ex.kv_pool, state_pool=self.ex.state_pool, positions=st["positions"],
++            rope_positions=st["rope"], rope_compress=st["compress"],
+             pages=st["pages"], seq_len=b * s, cu_seqlens=st["qo_indptr"], seq_slots=st["slots"],
+             seq_prefix_lens=[0] * b, seq_lens=[s] * b, verify_steps=s,
+             verify_scratch=torch.arange(b, dtype=torch.int32, device=d), inter_ssm=self.spec.inter_ssm,
+@@ -132,7 +149,7 @@
+         return graph_set.pick(self.sizes, b)
+ 
+     def run(self, tokens: torch.Tensor, positions: torch.Tensor, pages: torch.Tensor, slots: torch.Tensor, kv_all: list[torch.Tensor], *, sampled=False,
+-            side=None, variant: str = "dense"):
++            side=None, variant: str = "dense", rope: list[int] | None = None, compress: list[int] | None = None):
+         """Returns (norm rows [b*s, H], argmax or logits [b*s(, V)], ctx, features,
+         logits [b*s, V]) for the real rows; padded rows use slot 0, attend to page 0 and write the pool's padding pages.
+         The logits view is overwritten by the next replay. `side` is (requests,
+@@ -144,12 +161,12 @@
+         s = self.s_len
+         n = b * s
+         st["tokens"][:n].copy_(tokens)
+-        st["positions"][:n].copy_(positions)
++        _rope_inputs(st, n, positions, rope, compress)
+         st["pages"][:n].copy_(pages)
+         st["slots"][:b].copy_(slots)
+         if size > b:
+             st["tokens"][n:].zero_()
+-            st["positions"][n:].zero_()
++            st["pos3"][:, n:].zero_()
+             st["pages"][n:].copy_(self.ex.kv_pool.pad_pages(size * s - n))
+             st["slots"][b:].zero_()
+         pad_kv = [torch.zeros(s + 1, dtype=torch.int32, device=self.device) for _ in range(size - b)]
+@@ -204,9 +221,13 @@
+ 
+     def _static(self, b: int, rows: int) -> dict:
+         d, s = self.device, self.steps
++        pos3 = torch.zeros(3, rows, dtype=torch.int64, device=d)  # physical, rope, compress positions (vision_positions.rope_rows)
+         st = {
+             "tokens": torch.zeros(rows, dtype=torch.int64, device=d),
+-            "positions": torch.zeros(rows, dtype=torch.int64, device=d),
++            "pos3": pos3,
++            "positions": pos3[0],
++            "rope": pos3[1],
++            "compress": pos3[2],
+             "pages": torch.zeros(rows, dtype=torch.int32, device=d),
+             "slots": torch.zeros(b, dtype=torch.int32, device=d),
+             "qo_indptr": torch.zeros(b + 1, dtype=torch.int32, device=d),
+@@ -221,6 +242,7 @@
+         st["ctx"] = ForwardContext(
+             feature_request=self.spec.proposer.requirements.features,
+             mode="verify", kv_pool=self.ex.kv_pool, state_pool=self.ex.state_pool, positions=st["positions"],
++            rope_positions=st["rope"], rope_compress=st["compress"],
+             pages=st["pages"], seq_len=rows, cu_seqlens=st["qo_indptr"], seq_slots=st["slots"],
+             seq_prefix_lens=[0] * b, seq_lens=[s] * b, verify_steps=s,
+             verify_scratch=torch.arange(b, dtype=torch.int32, device=d), inter_ssm=self.spec.inter_ssm,
+@@ -293,14 +315,15 @@
+                                          generator=torch.Generator(device=self.device).manual_seed(b * 1000 + rows)))
+         return graph_set.time_replay(self._graphs[b, rows], rounds)
+ 
+-    def run(self, bucket: int, rows: int, lengths: list[int], width: int, tokens, positions, pages, slots, kv_all):
++    def run(self, bucket: int, rows: int, lengths: list[int], width: int, tokens, positions, pages, slots, kv_all,
++            rope: list[int] | None = None, compress: list[int] | None = None):
+         """Replay the (bucket, rows) graph. lengths: every sequence's rows (the requests', then the bucket's padded
+         ones), summing to `rows`; tokens/positions/pages [rows] packed; slots [bucket]; kv_all one page list per
+         sequence. Returns the graph's outputs, views the next replay overwrites: norm, argmax and features unpacked to
+         rows of `width` (the real requests' first), the logits packed ([rows, V]; `unpack` maps unpacked rows to them)."""
+         st = self._st[bucket, rows]
+         st["tokens"].copy_(tokens)
+-        st["positions"].copy_(positions)
++        _rope_inputs(st, rows, positions, rope, compress)
+         st["pages"].copy_(pages)
+         st["slots"].copy_(slots)
+         self._layout(st, lengths, width)
+diff -ruN a/hibana/engine/spec.py b/hibana/engine/spec.py
+--- a/hibana/engine/spec.py
++++ b/hibana/engine/spec.py
+@@ -44,6 +44,7 @@
+     ragged: tuple | None = None
+     slots_all: torch.Tensor | None = None
+     kv_all: list | None = None
++    eager: bool = False  # the round runs without graphs (an image request in the batch: M-RoPE rows are eager)
+ 
+ 
+ class SpecDecoder:
+@@ -265,7 +266,7 @@
+ 
+     # ---- one round ----
+     @torch.inference_mode()
+-    def round(self, reqs: list[Request]) -> None:
++    def round(self, reqs: list[Request], eager: bool = False) -> None:
+         debug_sync("before spec round", reqs)
+         learn = getattr(self.depth_policy, "observe_round", None) if self.device.type == "cuda" else None
+         if learn is not None:
+@@ -273,7 +274,7 @@
+             start = torch.cuda.Event(enable_timing=True)
+             start.record()
+             emitted = self.emitted
+-        batch = self.prepare(reqs)
++        batch = self.prepare(reqs, eager=eager)
+         debug_sync("after draft (prepare)", reqs)
+         self.verify(batch)
+         debug_sync("after verify and accept", reqs)
+@@ -306,7 +307,7 @@
+         for (b, rows, _, _, tokens, sampled), ms in zip(done, times):
+             learn(b, rows, ms, tokens, sampled=sampled)
+ 
+-    def prepare(self, reqs: list[Request]) -> Verification:
++    def prepare(self, reqs: list[Request], eager: bool = False) -> Verification:
+         """Reserve and draft one target verification batch."""
+         ex = self.ex
+         policy = getattr(self, 'depth_policy', None)
+@@ -333,7 +334,8 @@
+         toks_t, poss_t, slots_t = rows[0], rows[1], rows[2].to(torch.int32)
+         inputs = StepInputs(toks_t, poss_t, slots_t)
+         short = self.drafts_short
+-        proposed = self.proposer.propose(reqs, new_pages, inputs, graphs=ex.use_graphs, **({"depth": k} if short else {}))
++        graphs = ex.use_graphs and not eager
++        proposed = self.proposer.propose(reqs, new_pages, inputs, graphs=graphs, **({"depth": k} if short else {}))
+         proposal = proposed if isinstance(proposed, Proposal) else Proposal(proposed)
+         if proposal.columns is not None:
+             proposal.columns.on_wait = self.waiting
+@@ -343,7 +345,7 @@
+         if (y.shape != (b_sz, k if short else self.k) or y.dtype != torch.int64 or y.device.type != self.device.type
+                 or (self.device.index is not None and y.device.index != self.device.index)):
+             raise ValueError("proposer must return int64 [batch, k] on the target device")
+-        if getattr(self, "ragged_graphs", None) is not None and ex.use_graphs:
++        if getattr(self, "ragged_graphs", None) is not None and graphs:
+             return self._prepare_ragged(reqs, proposal, y, k, toks_t, poss_t, slots_t, new_pages, sampled, t0, timing)
+         proposal = proposal.head(k)
+         y = proposal.tokens
+@@ -363,7 +365,7 @@
+             kv_all.append(ex.state.step_pages(r)[:r.committed_len + s_len])
+             kv_indptr.append(kv_indptr[-1] + kv_all[-1].shape[0])
+         return Verification(list(reqs), proposal, sampled, tokens_v, positions, new_pages_flat,
+-                            slots_t, kv_all, t0, t1, drafted_host)
++                            slots_t, kv_all, t0, t1, drafted_host, eager=eager)
+ 
+     @staticmethod
+     def _drafted_host(reqs, drafts):
+@@ -432,8 +434,13 @@
+ 
+     def _verify_ragged(self, batch: Verification) -> None:
+         bucket, rows, lengths, width, limits, cells = batch.ragged
++        from hibana.model.flashnext.vision_positions import graph_rows
++        # the packed rows in order: each request's rows from its committed position, then the padding rows (position 0)
++        pairs = [(r, r.context_len - 1 + j) for r, n in zip(batch.requests, lengths) for j in range(n)]
++        pairs += [(None, 0)] * (rows - len(pairs))
++        rope, compress = graph_rows(pairs)
+         st = self.ragged_graphs.run(bucket, rows, lengths, width, batch.tokens, batch.positions, batch.pages,
+-                                    batch.slots_all, batch.kv_all)
++                                    batch.slots_all, batch.kv_all, rope=rope, compress=compress)
+         reqs = batch.requests
+         b = len(reqs)
+         n = b * width
+@@ -460,10 +467,13 @@
+         seqs = [(r.context_len - 1, s_len, pages) for r, pages in zip(batch.requests, batch.kv_pages)]
+         variant = self.ex.variant(seqs)
+         graphs = self.width_graphs.get(k, self.verify_graphs)
+-        if self.ex.use_graphs and graphs is not None and variant in graphs.variants:
++        if self.ex.use_graphs and not batch.eager and graphs is not None and variant in graphs.variants:
++            from hibana.model.flashnext.vision_positions import graph_rows
++            rope, compress = graph_rows([(r, r.context_len - 1 + j) for r in batch.requests for j in range(s_len)])
+             norm_rows, z_flat, ctx, layers, logits = graphs.run(batch.tokens, batch.positions, batch.pages,
+                                                                batch.slots, batch.kv_pages, sampled=batch.sampled,
+-                                                               side=(batch.requests, batch.proposal.tokens, seqs, batch.proposal.columns), variant=variant)
++                                                               side=(batch.requests, batch.proposal.tokens, seqs, batch.proposal.columns), variant=variant,
++                                                               rope=rope, compress=compress)
+             if self._constrain(batch, logits) and not batch.sampled:
+                 # The masked argmax, written into the graph's own buffer: the device acceptance graph reads it there
+                 # (and the masked logits for the relaxed rule). Sampled batches read the masked logits themselves.
+@@ -569,6 +579,9 @@
+         if getattr(self.ex, "extras", None) is not None:
+             ctx.extras = self.ex.extras.for_verify(batch.requests, batch.proposal.tokens,
+                                                    [(r.context_len - 1, s_len, pages) for r, pages in zip(batch.requests, batch.kv_pages)])
++        if any(getattr(r, "media", None) for r in batch.requests):
++            # Qwen image rows: M-RoPE rotary rows for each sequence's verified positions (physical positions stay for KV and masks)
++            self.ex._image_positions(ctx, [(r, r.context_len - 1, r.context_len - 1 + s_len, i) for i, r in enumerate(batch.requests)])
+         indptr = [0]
+         for pages in batch.kv_pages:
+             indptr.append(indptr[-1] + pages.shape[0])
+diff -ruN a/hibana/model/attention.py b/hibana/model/attention.py
+--- a/hibana/model/attention.py
++++ b/hibana/model/attention.py
+@@ -115,12 +115,12 @@
+ 
+ 
+     def decode(self, x: torch.Tensor, ctx: ForwardContext, x_q: torch.Tensor | None = None) -> torch.Tensor:
+-        q, k, v, gate = self._qkv(x, ctx.positions, x_q)
++        q, k, v, gate = self._qkv(x, ctx.rope(), x_q)
+         ctx.kv_pool.write(self.layer_id, ctx.out_pages, k, v)
+         attn = ctx.decode_wrapper.run(q, ctx.kv_pool.cache(self.layer_id), kv_cache_sf=ctx.kv_pool.scales(self.layer_id))
+         return self._finish(attn.view(x.shape[0], self.q_size), gate)
+ 
+     def forward(self, x: torch.Tensor, ctx: ForwardContext, x_q: torch.Tensor | None = None) -> torch.Tensor:
+         if ctx.mode in ("prefill", "verify"):
+-            return self.prefill(x, ctx.positions, ctx, x_q)
++            return self.prefill(x, ctx.rope(), ctx, x_q)
+         return self.decode(x, ctx, x_q)
+diff -ruN a/hibana/model/flashnext/attention.py b/hibana/model/flashnext/attention.py
+--- a/hibana/model/flashnext/attention.py
++++ b/hibana/model/flashnext/attention.py
+@@ -57,9 +57,9 @@
+             selected = self.indexer.replay(x, ctx, token_pages)
+             if selected is None:  # every row inside the budget: dense attention
+                 return super().forward(x, ctx, x_q)
+-            q, k, v, gate = self._qkv(x, ctx.positions)
++            q, k, v, gate = self._qkv(x, ctx.rope())
+             return self._sparse(q, k, v, gate, selected, ctx, token_pages)
+-        q, k, v, gate = self._qkv(x, ctx.positions)
++        q, k, v, gate = self._qkv(x, ctx.rope())
+         selected = self.indexer.run(x, ctx, token_pages)
+         if selected is None:  # every row sees at most the budget: the dense path is exact
+             if ctx.mode == "decode":
+@@ -75,8 +75,8 @@
+         """Eager Qwen M-RoPE path. Physical positions still drive QSA/page logic."""
+         from hibana.kernels.qk_norm_rope import qk_norm_rope
+         from hibana.model.flashnext.vision_positions import rotary_rows
+-        if ctx.mode not in ("prefill", "decode"):
+-            raise ValueError("multimodal verify requires M-RoPE graph integration")
++        if ctx.mode not in ("prefill", "decode", "verify"):
++            raise ValueError(f"multimodal attention does not run mode {ctx.mode}")
+         qkv = self.qkv(x)
+         t = qkv.shape[0]
+         gate = qkv[:, :self.q_size * 2].view(t, self.num_heads, 2 * self.head_dim)[..., self.head_dim:]
+diff -ruN a/hibana/model/flashnext/indexer.py b/hibana/model/flashnext/indexer.py
+--- a/hibana/model/flashnext/indexer.py
++++ b/hibana/model/flashnext/indexer.py
+@@ -110,15 +110,16 @@
+ 
+     def select(self, qk: torch.Tensor, positions: torch.Tensor, aux: torch.Tensor, table: torch.Tensor, base: torch.Tensor,
+                gcap: int, chunk: int | None = None, segments: list[int] | None = None,
+-               mrope_positions: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
++               mrope_positions: torch.Tensor | None = None, rope_pos: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+         """Selection for rows at `positions` from their index projections `qk`; `base` is each
+         row's offset in the flat page `table`, `gcap` the groups the widest row may see. `segments`: each sequence's
+-        row count, in row order, when eager rows may take the SM121 kernels of the same selection (`score_exact.py`)."""
++        row count, in row order, when eager rows may take the SM121 kernels of the same selection (`score_exact.py`).
++        `rope_pos` (graph rows of an image): the rotation of each query; the mask always reads `positions`."""
+         from hibana.kernels.qsa.selection import select_pages
+         t, h, d = qk.shape[0], self.heads, self.dim
+         q = gemma_rms(qk[:, : h * d].reshape(t, h, d), self.q_norm, self.eps)
+         if mrope_positions is None:
+-            q = rope_neox(q, positions, self.rotary_dim, self.theta)
++            q = rope_neox(q, positions if rope_pos is None else rope_pos, self.rotary_dim, self.theta)
+         else:
+             from hibana.model.flashnext.vision_positions import rotate_mrope
+             q = rotate_mrope(q, self.cos_sin, mrope_positions)
+@@ -141,11 +142,12 @@
+             qk = self.maintain(x, ctx, token_pages)
+             if not sparse:
+                 return None
+-            return self.select(qk, ctx.positions, aux, side.qsa_table, side.qsa_indptr[side.qsa_row_seq], side.qsa_gcap)
++            return self.select(qk, ctx.positions, aux, side.qsa_table, side.qsa_indptr[side.qsa_row_seq], side.qsa_gcap,
++                               rope_pos=ctx.rope())
+         qk = F.linear(x, self.qk)
+-        prepped = decode_prep.prep(qk, aux, token_pages, ctx.positions, self.q_norm, cos_sin, self.heads, self.eps, sparse,
++        prepped = decode_prep.prep(qk, aux, token_pages, ctx.rope(), self.q_norm, cos_sin, self.heads, self.eps, sparse,
+                                    side.qsa_indptr, side.qsa_row_seq)
+-        decode_prep.compress(aux, side.qsa_members, side.qsa_writes, ctx.positions, self.k_norm, cos_sin, self.eps)
++        decode_prep.compress(aux, side.qsa_members, side.qsa_writes, ctx.compress_pos(), self.k_norm, cos_sin, self.eps)
+         if not sparse:
+             return None
+         from hibana.kernels.qsa.selection import select_pages
+@@ -164,7 +166,7 @@
+         side = ctx.extras
+         keys = aux[side.qsa_members.long(), 0].float().mean(dim=1).to(x.dtype)
+         keys = gemma_rms(keys.unsqueeze(1), self.k_norm, self.eps)
+-        first = (ctx.positions - (self.ratio - 1)).clamp_min(0)
++        first = (ctx.compress_pos() - (self.ratio - 1)).clamp_min(0)
+         aux[side.qsa_writes.long(), 1] = rope_neox(keys, first, self.rotary_dim, self.theta)[:, 0]
+         return qk
+ 
+diff -ruN a/hibana/model/flashnext/vision_positions.py b/hibana/model/flashnext/vision_positions.py
+--- a/hibana/model/flashnext/vision_positions.py
++++ b/hibana/model/flashnext/vision_positions.py
+@@ -83,6 +83,57 @@
+     return [axis+suffix for axis in prefix]
+ 
+ 
++def rope_rows(pairs):
++    """Graph inputs for a batch's rows: `pairs` is (request or None, physical position) per row; returns two int lists.
++
++    rope: the rotary position of the row's query and key (the temporal axis of its M-RoPE; the physical position for
++    text, and for a row without a request: the padding rows).
++    compress: the value the indexer's group-key kernels take as their position argument (they rotate the group at
++    max(value - (ratio - 1), 0)), chosen so that the rotation is that of the group's first token's M-RoPE position.
++    For text this is the physical position itself, so text rows see exactly the values they saw before."""
++    rope, compress = [], []
++    for request, p in pairs:
++        if request is None or not request.media:
++            rope.append(p)
++            compress.append(p)
++            continue
++        rope.append(_scalar(request, p))
++        first = max(p - 3, 0)
++        compress.append(_scalar(request, first) + 3)
++    return rope, compress
++
++
++def _scalar(request, p):
++    """The one rotary position of physical position p, which graph kernels take: the three M-RoPE axes must agree. They do
++    for every text position and every generated one (the decode, verify and draft rows); an image's own tokens differ by
++    axis and would need the eager path."""
++    t, h, w = (axis[0] for axis in request_positions(request, p, p + 1))
++    if not t == h == w:
++        raise ValueError(f'graph rows need one rotary position; physical position {p} is an image token')
++    return t
++
++
++def graphable(request):
++    """Whether a request's rows can take the graphs: every row from its prompt's end on needs one rotary position, and the
++    compressed-key group of those rows starts at most three positions before the end. False only for a prompt that ends
++    inside an image (the templates always close an image with text)."""
++    if not request.media:
++        return True
++    try:
++        for p in range(max(len(request.prompt_ids) - 3, 0), len(request.prompt_ids)):
++            _scalar(request, p)
++    except ValueError:
++        return False
++    return True
++
++
++def graph_rows(pairs):
++    """`rope_rows` for a graph replay: None, None when no row has an image (the graph reads the physical positions)."""
++    if not any(request is not None and request.media for request, _ in pairs):
++        return None, None
++    return rope_rows(pairs)
++
++
+ def rotate_mrope(x, cos_sin, positions):
+     """Rotate [T,H,D] indexer states with Qwen interleaved M-RoPE."""
+     import torch
+diff -ruN a/hibana/proposers/mtp.py b/hibana/proposers/mtp.py
+--- a/hibana/proposers/mtp.py
++++ b/hibana/proposers/mtp.py
+@@ -25,6 +25,17 @@
+     return head.draft_head.argmax(head.head_input(hidden))
+ 
+ 
++def rope_positions(req, start: int, end: int, device) -> torch.Tensor:
++    """The rotary position of each physical position in [start, end), int64. Physical for text; for an image request its
++    M-RoPE temporal axis (model/flashnext/vision_positions.py: text after an image is p + delta). The draft KV stays
++    addressed by physical pages; only its rotation changes. Exact for text and generated positions, approximate inside
++    an image's span (the drafter sees one temporal coordinate per image token; this affects acceptance only)."""
++    if not getattr(req, "media", None):
++        return torch.arange(start, end, dtype=torch.int64, device=device)
++    from hibana.model.flashnext.vision_positions import request_positions
++    return torch.tensor(request_positions(req, start, end)[0], dtype=torch.int64, device=device)
++
++
+ CANDIDATES = 16  # a sampled MTP draft's law lives on the draft head's 16 best tokens (the 2-bit head's rescored shortlist)
+ 
+ 
+@@ -160,7 +171,7 @@
+                 hid = torch.cat([state.last_hidden.unsqueeze(0), norm_rows[:n - 1]], dim=0)
+             else:
+                 hid = norm_rows[first - start - 1:n - 1]
+-            pos = torch.arange(first, end, dtype=torch.int64, device=self.context.device)
++            pos = rope_positions(req, first, end, self.context.device)
+             pages = req.pages[first:end]
+             self.head.write_kv(toks, hid, pos, pages)
+             state.draft_pos = end
+@@ -198,7 +209,11 @@
+             full.append(torch.cat([req.pages[1:pos], pages[i, :depth]]))
+         # each step's positions and pages, [depth, batch], so a step's row is a contiguous view and not a launch
+         steps = torch.arange(depth, dtype=inputs.positions.dtype, device=inputs.positions.device).unsqueeze(1)
+-        positions = inputs.positions.unsqueeze(0) + steps
++        base = inputs.positions
++        if any(getattr(r, "media", None) for r in requests):  # an image request's drafts rotate by its M-RoPE position
++            base = torch.tensor([int(rope_positions(r, r.context_len - 1, r.context_len, base.device)[0]) for r in requests],
++                                dtype=base.dtype, device=base.device)
++        positions = base.unsqueeze(0) + steps
+         step_pages = pages[:, :depth].t().contiguous()
+         sampled = self.sample and any(not r.params.greedy for r in requests)
+         laws, supports = [], []
+@@ -287,7 +302,7 @@
+         start, end = req.committed_len - count, req.committed_len
+         norm = features.norm[row, :count]
+         hidden = torch.cat([state.pending_hidden, norm[:count - 1]])
+-        positions = torch.arange(start, end, dtype=torch.int64, device=self.context.device)
++        positions = rope_positions(req, start, end, self.context.device)
+         # Preserve each row's projection shape/rounding. Accepted draft KV must
+         # be target-conditioned, including the fully accepted bonus input.
+         self.head.write_kv(inputs, hidden, positions, req.pages[start:end])

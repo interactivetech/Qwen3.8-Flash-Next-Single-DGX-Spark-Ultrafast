@@ -1,0 +1,61 @@
+diff --git a/hibana/api/parsers/tools.py b/hibana/api/parsers/tools.py
+index 8a12e72..cb6d773 100644
+--- a/hibana/api/parsers/tools.py
++++ b/hibana/api/parsers/tools.py
+@@ -29,22 +29,44 @@ def has_tool_call(text: str) -> bool:
+     return TOOL_CALL_START in text
+ 
+ 
++def _types(schema: dict) -> list[str]:
++    """The JSON types a parameter schema allows: `type` as a string or a list, or the branches of anyOf/oneOf
++    (Pydantic writes Optional[list[str]] as anyOf [array, null])."""
++    t = schema.get("type")
++    if isinstance(t, str):
++        return [t]
++    if isinstance(t, list):
++        return [x for x in t if isinstance(x, str)]
++    out = []
++    for branch in (schema.get("anyOf") or []) + (schema.get("oneOf") or []):
++        if isinstance(branch, dict):
++            out += [x for x in _types(branch) if x not in out]
++    return out
++
++
+ def _cast(value: str, schema: dict | None):
+     if not schema:
+         return value
+-    t = schema.get("type")
++    types = _types(schema)
+     v = value.strip()
+-    try:
+-        if t == "integer":
+-            return int(v)
+-        if t == "number":
+-            return float(v)
+-        if t == "boolean":
+-            return v.lower() in ("true", "1", "yes")
+-        if t in ("object", "array"):
+-            return json.loads(v)
+-    except (ValueError, json.JSONDecodeError):
+-        return value
++    if "null" in types and v == "null":
++        return None
++    for t in types:
++        try:
++            if t == "integer":
++                return int(v)
++            if t == "number":
++                return float(v)
++            if t == "boolean":
++                if v.lower() in ("true", "false", "1", "0", "yes", "no"):
++                    return v.lower() in ("true", "1", "yes")
++                continue
++            if t in ("object", "array"):
++                parsed = json.loads(v)
++                if isinstance(parsed, dict if t == "object" else list):
++                    return parsed
++        except (ValueError, json.JSONDecodeError):
++            continue
+     return value
+ 
+ 

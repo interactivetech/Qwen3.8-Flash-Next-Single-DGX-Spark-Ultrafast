@@ -1,0 +1,591 @@
+--- a/hibana/api/media.py
++++ b/hibana/api/media.py
+@@ -37,6 +37,7 @@
+     digest: bytes  # SHA-256 of the encoder's identity and the encoded bytes
+     tokens: int  # the embeddings it becomes
+     data: bytes  # the encoded image
++    grid: tuple[int, int, int] | None = None
+ 
+ 
+ def image_bytes(part: dict) -> bytes:
+@@ -74,13 +75,15 @@
+     raw = image_bytes(part)
+     digest = hashlib.sha256(vision.identity + raw).digest()
+     if digest not in seen:
+-        tokens = vision.tokens(*media.size(raw))
++        width, height = media.size(raw)
++        tokens = vision.tokens(width, height)
+         if decode and digest not in _DECODED:
+             media.decode(raw)
+             if len(_DECODED) >= 4096:
+                 _DECODED.clear()
+             _DECODED[digest] = None
+-        seen[digest] = Prepared(digest, tokens, raw)
++        grid = vision.grid(width, height) if hasattr(vision, "grid") else None
++        seen[digest] = Prepared(digest, tokens, raw, grid)
+     return seen[digest]
+ 
+ 
+@@ -124,6 +127,23 @@
+     return value
+ 
+ 
++def template_markers(messages):
++    """Replace image parts after escaping user text, for a Qwen chat template.
++
++    Qwen normally renders its own visual markers. Rendering our private marker
++    as text lets expand() insert the model-specific start/end IDs exactly once.
++    """
++    out = []
++    for message in messages:
++        content = message.get("content")
++        if isinstance(content, list):
++            content = [{"type": "text", "text": MARKER}
++                       if isinstance(part, dict) and part.get("type") in IMAGE_PARTS else part for part in content]
++            message = {**message, "content": content}
++        out.append(message)
++    return out
++
++
+ class Markers:
+     """`tok` for a render of escaped messages: each `<image>` the template wrote is the image token, and the rest,
+     the escapes undone, is encoded with the image tokens read as text (`<image>`, `<img>` and `</img>` in a message are
+@@ -131,7 +151,12 @@
+ 
+     def __init__(self, tok, vision):
+         self.image_token = vision.image_token
+-        self.text = tok.without_specials({vision.image_token, vision.image_start, vision.image_end})
++        # Removing Qwen's visual added tokens renumbers subsequent added-token
++        # IDs in tokenizers, corrupting <think>, </think>, and other markers.
++        # Its private template marker is plain text, so retain the original
++        # tokenizer and preserve every model token ID.
++        self.text = tok if getattr(vision, "template_markers", False) else tok.without_specials(
++            {vision.image_token, vision.image_start, vision.image_end})
+ 
+     def encode_with_offsets(self, text: str) -> tuple[list[int], list[tuple[int, int]]]:
+         ids, offsets, at = [], [], 0
+@@ -162,7 +187,8 @@
+     for mark, image in zip(marks, images):
+         out += ids[last:mark]
+         out.append(vision.image_start)
+-        engine_images.append(media.Image(start=len(out), ids=media.placeholder_ids(image.digest, image.tokens), data=image.data))
++        engine_images.append(media.Image(start=len(out), ids=media.placeholder_ids(image.digest, image.tokens), data=image.data,
++                                         grid=image.grid))
+         out += engine_images[-1].ids
+         out.append(vision.image_end)
+         last = mark + 1
+--- a/hibana/api/server.py
++++ b/hibana/api/server.py
+@@ -160,6 +160,8 @@
+         if vision is not None:
+             folded, images = await asyncio.to_thread(media.prepare, folded, vision, decode)
+             folded, tools = media.escape(folded), media.escape(tools)
++            if getattr(vision, "template_markers", False):
++                folded = media.template_markers(folded)
+         head = ""  # rendered before the full prompt: the template's last render is the one tests and logs look at
+         if boundary and len(folded) > 1:
+             with contextlib.suppress(Exception):  # a template that rejects a partial conversation: no boundary
+--- a/hibana/engine/context.py
++++ b/hibana/engine/context.py
+@@ -48,6 +48,11 @@
+     # images in a prefill (engine/media.py): the rows whose input embedding is an image's (int64), and those embeddings
+     media_rows: torch.Tensor | None = None
+     media_embeds: torch.Tensor | None = None
++    # Optional multimodal rotary coordinates; physical positions above remain
++    # unchanged for paging, causal masking, and sparse-attention selection.
++    mrope_positions: torch.Tensor | None = None  # [3,T]
++    mrope_groups: torch.Tensor | None = None  # [3,completed QSA groups]
++    mrope_prior: torch.Tensor | None = None  # [3,T], group first at decode
+     gdn_plan: GdnPrefillPlan | None = field(default=None, init=False, repr=False)
+ 
+     # speculative verify: k+1 tokens per sequence; GDN runs the recurrent
+--- a/hibana/engine/executor.py
++++ b/hibana/engine/executor.py
+@@ -549,6 +549,9 @@
+         """Prompt ids as the model reads them: an image's placeholder ids become the image token (engine/media.py)."""
+         return text_ids(ids, self.vision.image_token) if req.media else ids
+ 
++    def _qwen_image(self, req: Request) -> bool:
++        return bool(req.media and getattr(self.vision, "uses_mrope", False))
++
+     def prefill_ready(self, req: Request, n: int, wait: bool) -> int:
+         """How many of the next `n` prompt tokens of `req` can prefill now: up to an image whose encode is still running
+         (`media.Encoder.ready`), or all `n` with `wait`. The scheduler asks before each chunk."""
+@@ -568,6 +571,34 @@
+         if rows:
+             ctx.media_rows = upload(rows, torch.int64, self.device)
+             ctx.media_embeds = torch.cat(pieces)
++
++    def _image_positions(self, ctx: ForwardContext, spans: list[tuple[Request, int, int, int]]) -> None:
++        """Keep Qwen's rotary coordinates distinct from physical KV positions."""
++        if not getattr(self.vision, "uses_mrope", False) or not any(req.media for req, _, _, _ in spans):
++            return
++        from hibana.model.flashnext.vision_positions import request_positions
++        axes, groups, prior = [[], [], []], [[], [], []], [[], [], []]
++        ratio = self.target.indexer_compress_ratio
++        for req, start, end, _ in spans:
++            p = request_positions(req, start, end)
++            for axis in range(3):
++                axes[axis].extend(p[axis])
++            # Match the indexer's _groups iteration: groups are ordered by
++            # sequence, then their final physical position in this chunk.
++            for last in range(start + (ratio - 1 - start) % ratio, end, ratio):
++                g = request_positions(req, last - ratio + 1, last - ratio + 2)
++                for axis in range(3):
++                    groups[axis].append(g[axis][0])
++            if ctx.mode != "prefill":
++                for physical in range(start, end):
++                    first = max(physical - ratio + 1, 0)
++                    q = request_positions(req, first, first + 1)
++                    for axis in range(3):
++                        prior[axis].append(q[axis][0])
++        ctx.mrope_positions = torch.tensor(axes, dtype=torch.int64, device=self.device)
++        ctx.mrope_groups = torch.tensor(groups, dtype=torch.int64, device=self.device)
++        if ctx.mode != "prefill":
++            ctx.mrope_prior = torch.tensor(prior, dtype=torch.int64, device=self.device)
+ 
+     def _prepare_single_prefill(self, req: Request, max_tokens: int | None) -> PrefillBatch:
+         """Prefill up to `max_tokens` of the remaining prompt (all of it by
+@@ -595,6 +626,7 @@
+             prefix_pages=req.pages[:start] if start else None,
+         )
+         self._image_rows(ctx, [(req, start, end, 0)])
++        self._image_positions(ctx, [(req, start, end, 0)])
+         if start:
+             ctx.prefix_attention = self._prefix_attention([t], [start], req.pages[:start])
+             if ctx.prefix_attention is None:
+@@ -650,6 +682,7 @@
+             checkpoint_seqs=[i for i, _, _ in checkpoints],
+         )
+         self._image_rows(ctx, spans)
++        self._image_positions(ctx, spans)
+         if any(prefix_lens):
+             ctx.prefix_attention = self._prefix_attention(seq_lens, prefix_lens, torch.cat(kv_indices))
+             if ctx.prefix_attention is None:
+@@ -682,6 +715,8 @@
+             self._chunk_checkpoint(req, req.prefill_pos + n_new)
+         if self.spec is not None:
+             for i, (req, n_new) in enumerate(chunks):
++                if self._qwen_image(req):
++                    continue  # prototype: multimodal drafts require separate M-RoPE integration
+                 rows = {"norm": out["norm"][cu[i]:cu[i + 1]]}
+                 if "features" in out:
+                     rows["features"] = {lid: value[cu[i]:cu[i + 1]] for lid, value in out["features"].items()}
+@@ -698,7 +733,7 @@
+             req.prefill_seconds += elapsed
+         for i, tok in zip(finishing, tokens or []):
+             chunks[i][0].push(int(tok))
+-            if self.spec is not None:
++            if self.spec is not None and not self._qwen_image(chunks[i][0]):
+                 self.spec.start(chunks[i][0], int(tok))
+ 
+     def _finish_single_prefill(self, batch, out):
+@@ -708,14 +743,14 @@
+         new_ids = self._model_ids(req, req.prefill_ids[start:end])
+         self.state.commit_prefill(req, end)
+         self._chunk_checkpoint(req, end)
+-        if self.spec is not None:
++        if self.spec is not None and not self._qwen_image(req):
+             self.spec.ingest_prefill(req, new_ids, start, out)
+         self.state.checkpoint(req, end)  # the drafter ingested the chunk: its snapshots go in, the lock moves
+         token = None
+         if end == n:
+             logits = self.model.logits(out["norm"][-1:])
+             token = int(self.sampler.sample(logits, [req.params], [req.generator], sample_masks([req], logits.shape[-1])).item())
+-            if self.spec is not None:
++            if self.spec is not None and not self._qwen_image(req):
+                 self.spec.start(req, token)
+         if self.timing:
+             torch.cuda.synchronize()
+@@ -792,7 +827,7 @@
+         With speculative decoding on, greedy requests go through spec rounds
+         and sampled ones through the plain step."""
+         assert 0 < len(reqs) <= self.max_batch
+-        spec_reqs = [r for r in reqs if self.spec is not None and self.spec.ready(r)
++        spec_reqs = [r for r in reqs if self.spec is not None and not self._qwen_image(r) and self.spec.ready(r)
+                      and (r.params.greedy or not self.spec.proposer.requirements.greedy_only)]
+         if spec_reqs and self.spec.depth_policy.choose(reqs) == 0:
+             spec_reqs = []  # a wide batch at depth 0 (the throughput profile): plain decode; the proposer still follows
+@@ -810,7 +845,7 @@
+         step_pages = [self.state.step_pages(r) for r in reqs]
+         seqs = [(r.context_len - 1, 1, pages) for r, pages in zip(reqs, step_pages)]
+         variant = self.variant(seqs)
+-        if self.use_graphs and self.graphs is not None and variant in self.graphs.variants:
++        if self.use_graphs and self.graphs is not None and variant in self.graphs.variants and not any(self._qwen_image(r) for r in reqs):
+             result = self.graphs.run(
+                 [r.output_ids[-1] for r in reqs],
+                 [r.context_len - 1 for r in reqs],
+@@ -834,6 +869,7 @@
+                 slots=upload([r.slot for r in reqs], torch.int32, self.device),
+                 out_pages=new_pages, decode_wrapper=self._decode_wrapper, batch_size=len(reqs),
+             )
++            self._image_positions(ctx, [(r, r.context_len - 1, r.context_len, i) for i, r in enumerate(reqs)])
+             if self._features_wanted() is not None:
+                 ctx.feature_request = self._features_wanted()
+             if self.extras is not None:
+@@ -846,7 +882,7 @@
+         for i, (r, tok) in enumerate(zip(reqs, next_tokens)):
+             pending = r.output_ids[-1]
+             self.state.commit(r, 1)
+-            if self.spec is not None:
++            if self.spec is not None and not self._qwen_image(r):
+                 rows = {"norm": out["norm"][i:i + 1]}
+                 if "features" in out:
+                     rows["features"] = {lid: value[i:i + 1] for lid, value in out["features"].items()}
+--- a/hibana/engine/media.py
++++ b/hibana/engine/media.py
+@@ -39,6 +39,7 @@
+     start: int  # the prompt position of its first placeholder
+     ids: tuple[int, ...]  # its placeholder ids (`placeholder_ids`)
+     data: bytes  # the encoded image, kept for a prefill that is retracted and redone
++    grid: tuple[int, int, int] | None = None  # model-specific patch grid, if positions need it
+     pixels: Future | None = None  # the encoder's input, being made on the worker thread
+     embeds: torch.Tensor | None = None  # [len(ids), hidden], from its encode until its span is prefilled
+     encoded: torch.cuda.Event | None = None  # recorded on the side stream after the encode, until a prefill waits on it
+--- a/hibana/model/flashnext/attention.py
++++ b/hibana/model/flashnext/attention.py
+@@ -45,6 +45,8 @@
+         return self.qkv.bytes + self.o.bytes + (self.indexer.bytes if self.indexer is not None else 0)
+ 
+     def forward(self, x: torch.Tensor, ctx, x_q: torch.Tensor | None = None) -> torch.Tensor:
++        if ctx.mrope_positions is not None:
++            return self._multimodal_forward(x, ctx)
+         if self.indexer is None:
+             return super().forward(x, ctx, x_q)
+         token_pages = ctx.out_pages if ctx.mode == "decode" else ctx.pages
+@@ -68,6 +70,35 @@
+                 attn = self._prefill_attention(q, k, v, ctx)
+             return self._finish(attn, gate)
+         return self._sparse(q, k, v, gate, selected, ctx, token_pages)
++
++    def _multimodal_forward(self, x: torch.Tensor, ctx) -> torch.Tensor:
++        """Eager Qwen M-RoPE path. Physical positions still drive QSA/page logic."""
++        from hibana.kernels.qk_norm_rope import qk_norm_rope
++        from hibana.model.flashnext.vision_positions import rotary_rows
++        if ctx.mode not in ("prefill", "decode"):
++            raise ValueError("multimodal verify requires M-RoPE graph integration")
++        qkv = self.qkv(x)
++        t = qkv.shape[0]
++        gate = qkv[:, :self.q_size * 2].view(t, self.num_heads, 2 * self.head_dim)[..., self.head_dim:]
++        rows = rotary_rows(self.rope.cos_sin, ctx.mrope_positions)
++        q, k = qk_norm_rope(qkv, torch.arange(t, dtype=torch.int64, device=x.device), rows,
++                             self.q_norm.weight, self.k_norm.weight, self.num_heads, self.num_kv_heads,
++                             self.head_dim, self.rope.rotary_dim, self.eps)
++        v = qkv[:, self.q_size * 2 + self.kv_size:].view(t, self.num_kv_heads, self.head_dim).contiguous()
++        token_pages = ctx.out_pages if ctx.mode == "decode" else ctx.pages
++        if self.indexer is not None:
++            if ctx.extras is None or ctx.extras.qsa_seqs is None:
++                raise ValueError("multimodal attention requires eager QSA sequence metadata")
++            selected = self.indexer.run(x, ctx, token_pages)
++            if selected is not None:
++                return self._sparse(q, k, v, gate, selected, ctx, token_pages)
++        if ctx.mode == "decode":
++            ctx.kv_pool.write(self.layer_id, token_pages, k, v)
++            attn = ctx.decode_wrapper.run(q, ctx.kv_pool.cache(self.layer_id),
++                                         kv_cache_sf=ctx.kv_pool.scales(self.layer_id)).view(t, self.q_size)
++        else:
++            attn = self._prefill_attention(q, k, v, ctx)
++        return self._finish(attn, gate)
+ 
+     def _sparse(self, q, k, v, gate, selected, ctx, token_pages) -> torch.Tensor:
+         from hibana.kernels.qsa import sparse_attention
+--- a/hibana/model/flashnext/extras.py
++++ b/hibana/model/flashnext/extras.py
+@@ -69,7 +69,11 @@
+     def _history(self, req, start: int) -> list[int]:
+         """The two tokens before absolute position `start` of the request (EOS before the sequence)."""
+         full = req.prompt_ids + req.output_ids
+-        return [full[i] if i >= 0 else self.eos for i in (start - 2, start - 1)]
++        history = [full[i] if i >= 0 else self.eos for i in (start - 2, start - 1)]
++        vision = getattr(getattr(self, "model", None), "vision", None)
++        if getattr(req, "media", ()) and vision is not None:
++            history = [token if token >= 0 else vision.image_token for token in history]
++        return history
+ 
+     def _decode_rows(self, reqs) -> torch.Tensor:
+         """Table rows for each request's pending decode token (host gather) -> device uint8 [B, heads, row_bytes]."""
+@@ -138,7 +142,11 @@
+             if req in self._prefetched or end >= len(req.prompt_ids):
+                 continue
+             self._prefetched.add(req)
+-            ids = torch.tensor(req.prompt_ids[end:], dtype=torch.int64)
++            raw = req.prompt_ids[end:]
++            vision = getattr(getattr(self, "model", None), "vision", None)
++            if getattr(req, "media", ()) and vision is not None:
++                raw = [token if token >= 0 else vision.image_token for token in raw]
++            ids = torch.tensor(raw, dtype=torch.int64)
+             history = torch.tensor(self._history(req, end), dtype=torch.int64)
+             self.ple.table.prefetch(self.ple.ngram_ids(ids, history, self.eos).numpy())
+ 
+--- a/hibana/model/flashnext/indexer.py
++++ b/hibana/model/flashnext/indexer.py
+@@ -85,9 +85,9 @@
+         if ctx.extras is not None:
+             ctx.extras.qsa_optimized_prefill=False
+         optimized=getattr(self,"_prefill",None)
+-        if optimized is not None and optimized.eligible(x,ctx,self):
++        if getattr(ctx, "mrope_positions", None) is None and optimized is not None and optimized.eligible(x,ctx,self):
+             return optimized.run(self,x,ctx,token_pages)
+-        if getattr(self, "_prefill_backend", "original") == "optimized" and ctx.mode == "prefill":
++        if getattr(ctx, "mrope_positions", None) is None and getattr(self, "_prefill_backend", "original") == "optimized" and ctx.mode == "prefill":
+             from hibana.kernels.qsa.prefill import PrefillKernels
+             if PrefillKernels.in_scope(x, ctx, self):
+                 raise ValueError("HIBANA_QSA_PREFILL_BACKEND=optimized: unsupported sparse eager prefill; "
+@@ -98,24 +98,30 @@
+         qk = F.linear(x, self.qk)
+         aux[token_pages.long(), 0] = qk[:, h * d:]
+         plan = self._plan(ctx.extras, x.device)
+-        self._compress(aux, ctx.extras.qsa_seqs, x.device, x.dtype, plan)
++        self._compress(aux, ctx.extras.qsa_seqs, x.device, x.dtype, plan, getattr(ctx, "mrope_groups", None))
+         if plan["dense"]:
+             return None
+         # scores and top-k in chunks of 256 rows (a bounded score buffer); the queries' norm and rotation, and the
+         # selection after the top-k, for every row at once (row by row the same bits)
+         # (eager prefill on SM121: the same selection from faster kernels, `kernels/qsa/score_exact.py`)
+         segments = [n for _, n, _ in ctx.extras.qsa_seqs] if getattr(ctx, "mode", None) == "prefill" else None
+-        return self.select(qk, ctx.positions, aux, plan["table"], plan["base"], plan["gcap"], chunk=256, segments=segments)
++        return self.select(qk, ctx.positions, aux, plan["table"], plan["base"], plan["gcap"], chunk=256, segments=segments,
++                           mrope_positions=getattr(ctx, "mrope_positions", None))
+ 
+     def select(self, qk: torch.Tensor, positions: torch.Tensor, aux: torch.Tensor, table: torch.Tensor, base: torch.Tensor,
+-               gcap: int, chunk: int | None = None, segments: list[int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
++               gcap: int, chunk: int | None = None, segments: list[int] | None = None,
++               mrope_positions: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+         """Selection for rows at `positions` from their index projections `qk`; `base` is each
+         row's offset in the flat page `table`, `gcap` the groups the widest row may see. `segments`: each sequence's
+         row count, in row order, when eager rows may take the SM121 kernels of the same selection (`score_exact.py`)."""
+         from hibana.kernels.qsa.selection import select_pages
+         t, h, d = qk.shape[0], self.heads, self.dim
+         q = gemma_rms(qk[:, : h * d].reshape(t, h, d), self.q_norm, self.eps)
+-        q = rope_neox(q, positions, self.rotary_dim, self.theta)
++        if mrope_positions is None:
++            q = rope_neox(q, positions, self.rotary_dim, self.theta)
++        else:
++            from hibana.model.flashnext.vision_positions import rotate_mrope
++            q = rotate_mrope(q, self.cos_sin, mrope_positions)
+         if segments is not None:
+             from hibana.kernels.qsa import score_exact
+             if score_exact.supported(q, aux, self.ratio, self.budget):
+@@ -233,7 +239,7 @@
+         return {"members": pages[torch.from_numpy(index).to(device)].long(),
+                 "first": torch.from_numpy(np.concatenate(ends) - (r - 1)).to(device)}
+ 
+-    def _compress(self, aux, seqs, device, dtype, groups: dict | None = None) -> None:
++    def _compress(self, aux, seqs, device, dtype, groups: dict | None = None, mrope_positions=None) -> None:
+         """Write the compressed key of every group the sequences' new tokens complete; `groups`: `_groups(seqs)`."""
+         groups = groups if groups is not None else self._groups(seqs, device)
+         members = groups["members"]
+@@ -241,4 +247,9 @@
+             return
+         keys = aux[members, 0].float().mean(dim=1).to(dtype)  # FP32 mean, stored in the activation dtype
+         keys = gemma_rms(keys.unsqueeze(1), self.k_norm, self.eps)
+-        aux[members[:, -1], 1] = rope_neox(keys, groups["first"], self.rotary_dim, self.theta)[:, 0]
++        if mrope_positions is None:
++            rotated = rope_neox(keys, groups["first"], self.rotary_dim, self.theta)
++        else:
++            from hibana.model.flashnext.vision_positions import rotate_mrope
++            rotated = rotate_mrope(keys, self.cos_sin, mrope_positions)
++        aux[members[:, -1], 1] = rotated[:, 0]
+--- a/hibana/model/flashnext/model.py
++++ b/hibana/model/flashnext/model.py
+@@ -108,7 +108,8 @@
+         if expert_layers and expert_layers != set(range(target.num_layers)):
+             raise ValueError(f"the W3 checkpoint carries routed experts for {len(expert_layers)} of {target.num_layers} layers")
+         # the experts dominate, and each rank loads its half
+-        check_load_headroom((target.weight_load_peak_bytes - (_w3_expert_saving(target) if expert_layers else 0)) // tp.size)
++        check_load_headroom((target.weight_load_peak_bytes - (_w3_expert_saving(target) if expert_layers else 0)) // tp.size
++                            + (1_100_000_000 if current().vision else 0))
+         self.device = torch.device(device)
+         cfg = target.load_model_config(snap)
+         types = target.layer_types_of(cfg)
+@@ -150,6 +151,14 @@
+         # Vocabulary-parallel: each rank scores its rows of the vocabulary and `logits` gathers them.
+         self.lm_head = TrunkLinear.load(w, ["lm_head.weight"], self.device, self.precision,
+                                         ColumnParallel((div_even(target.vocab_size, tp.size),)))
++        self.vision = None
++        if current().vision:
++            if tp.size != 1:
++                raise ValueError("Experimental Flash-Next vision currently supports one Spark")
++            from hibana.model.flashnext.vision import QwenVision
++            self.vision = QwenVision(w, snap, self.device)
++            if log:
++                log(f"  vision: Qwen image tower and projector ({self.vision.bytes / 2**30:.2f} GiB)")
+         w.close()
+         torch.cuda.synchronize()
+         # Bytes one decode token streams: the trunk, the head, one embedding row and its routed experts.
+@@ -239,6 +248,8 @@
+         if ctx.mode == "prefill":
+             prepare_gdn_prefill(ctx, len(input_ids), input_ids.device)
+         x = torch.nn.functional.embedding(input_ids, self.embed)
++        if ctx.media_rows is not None:
++            x.index_copy_(0, ctx.media_rows, ctx.media_embeds)
+         hyper = torch.cat([x] * self.target.hc_count, dim=-1)
+         ctx.capture = capture
+         out: dict = {"input_ids": input_ids, "positions": ctx.positions}
+--- /dev/null
++++ b/hibana/model/flashnext/vision.py
+@@ -0,0 +1,67 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Flash-Next Qwen vision tower on the shared Hibana image interface.
++
++Prototype: the weight layout matches the Transformers Qwen3.5 vision module.
++Decoder M-RoPE integration is required before this can be enabled in a server.
++"""
++from __future__ import annotations
++import json
++import torch
++from PIL import Image
++from transformers import Qwen2VLImageProcessorPil
++from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import smart_resize
++from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionConfig, Qwen3_5VisionModel
++
++PATCH=16
++MERGE=2
++MIN_PIXELS=256*256
++MAX_PIXELS=1024*1024
++IMAGE_TOKEN=248056
++IMAGE_START=248053
++IMAGE_END=248054
++IDENTITY=b'qwen4-exp-vision:v1:patch16:merge2:pil-bicubic:65536-1048576\n'
++
++class QwenVision:
++    image_token, image_start, image_end, identity = IMAGE_TOKEN, IMAGE_START, IMAGE_END, IDENTITY
++    template_markers = True
++    uses_mrope = True
++    workspace_bytes = 1024 * 2**20
++
++    def __init__(self, weights, snap, device):
++        self.device = torch.device(device)
++        config=json.loads((snap / 'config.json').read_text())['vision_config']
++        config.pop('model_type',None)
++        config.pop('deepstack_visual_indexes',None)
++        with torch.device('meta'):
++            self.tower=Qwen3_5VisionModel(Qwen3_5VisionConfig(**config))
++        state={name:weights.get('model.visual.'+name).to(self.device) for name in self.tower.state_dict()}
++        self.tower.load_state_dict(state,assign=True)
++        r=self.tower.rotary_pos_emb
++        r.inv_freq=1.0/(r.theta ** (torch.arange(0,r.dim,2,dtype=torch.float32,device=self.device)/r.dim))
++        self.tower.eval()
++        self.processor=Qwen2VLImageProcessorPil(patch_size=PATCH,temporal_patch_size=2,merge_size=MERGE,
++                   size={'shortest_edge':MIN_PIXELS,'longest_edge':MAX_PIXELS},
++                   image_mean=[0.5]*3,image_std=[0.5]*3)
++
++    @property
++    def bytes(self):
++        return sum(p.numel()*p.element_size() for p in self.tower.parameters())
++
++    @staticmethod
++    def grid(width,height):
++        h,w=smart_resize(height,width,factor=PATCH*MERGE,min_pixels=MIN_PIXELS,max_pixels=MAX_PIXELS)
++        return 1,h//PATCH,w//PATCH
++
++    @classmethod
++    def tokens(cls,width,height):
++        _,h,w=cls.grid(width,height)
++        return (h//MERGE)*(w//MERGE)
++
++    def preprocess(self,rgb):
++        result=self.processor(images=Image.fromarray(rgb),return_tensors='pt')
++        return result['pixel_values'],result['image_grid_thw']
++
++    @torch.inference_mode()
++    def encode(self,pixels):
++        values,grid=pixels
++        return self.tower(values.to(self.device,dtype=torch.bfloat16),grid_thw=grid.to(self.device)).pooler_output
+--- /dev/null
++++ b/hibana/model/flashnext/vision_positions.py
+@@ -0,0 +1,94 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Qwen image M-RoPE positions, independent of physical KV and cache positions.
++
++A span is (first placeholder index, merged height, merged width). Image
++positions use temporal/height/width coordinates; all surrounding text uses the
++same scalar on every axis. The returned delta applies to subsequent text.
++"""
++def image_positions(length, spans):
++    if length < 1:
++        raise ValueError('prompt must not be empty')
++    result = [[], [], []]
++    token_index = position = 0
++    for start, height, width in spans:
++        end = start + height * width
++        if start < token_index or height < 1 or width < 1 or end > length:
++            raise ValueError('invalid or overlapping image span')
++        for value in range(position, position + start - token_index):
++            for axis in result:
++                axis.append(value)
++        position += start - token_index
++        for row in range(height):
++            for col in range(width):
++                result[0].append(position)
++                result[1].append(position + row)
++                result[2].append(position + col)
++        position += max(height, width)
++        token_index = end
++    for value in range(position, position + length - token_index):
++        for axis in result:
++            axis.append(value)
++    position += length - token_index
++    return result, position - length
++
++
++def rotary_rows(cos_sin, positions):
++    """Compose [T, rotary_dim] cos/sin rows for Qwen's interleaved THW layout.
++
++    cos_sin is the existing FP32 [max_position, rotary_dim] table; positions is
++    int64 [3,T]. A row can be passed to the existing Q/K kernel using row ids
++    arange(T), leaving physical cache positions untouched.
++    """
++    import torch
++    if positions.ndim != 2 or positions.shape[0] != 3:
++        raise ValueError('expected position tensor [3, tokens]')
++    half=cos_sin.shape[1]//2
++    if half != 32:
++        raise ValueError('Flash-Next rotary half-width must be 32')
++    lane=torch.arange(half,device=positions.device)
++    axis=lane.remainder(3)
++    freq_pos=positions[axis,:].transpose(0,1)
++    cos=cos_sin[freq_pos,lane]
++    sin=cos_sin[freq_pos,lane+half]
++    return torch.cat((cos,sin),dim=-1).contiguous()
++
++
++def request_positions(request, start, end):
++    """M-RoPE positions for physical token interval [start,end), including generated tokens.
++
++    Cache is request-local: prefix-reused sessions still compute their own map
++    from the complete current prompt and image spans, independent of GPU pages.
++    """
++    if start < 0 or end < start:
++        raise ValueError('invalid requested interval')
++    if not request.media:
++        values=list(range(start,end))
++        return [values,values,values]
++    cache=getattr(request,'_flashnext_mrope',None)
++    if cache is None:
++        spans=[]
++        for image in request.media:
++            if image.grid is None or image.grid[0] != 1 or image.grid[1] % 2 or image.grid[2] % 2:
++                raise ValueError('invalid Qwen image grid')
++            h,w=image.grid[1]//2,image.grid[2]//2
++            if h*w != len(image.ids):
++                raise ValueError('image grid does not match placeholders')
++            spans.append((image.start,h,w))
++        cache=image_positions(len(request.prompt_ids),spans)
++        request._flashnext_mrope=cache
++    mapped,delta=cache
++    prompt_length=len(request.prompt_ids)
++    prefix=[axis[start:min(end,prompt_length)] for axis in mapped] if start < prompt_length else [[],[],[]]
++    suffix=list(range(max(start,prompt_length)+delta,end+delta)) if end > prompt_length else []
++    return [axis+suffix for axis in prefix]
++
++
++def rotate_mrope(x, cos_sin, positions):
++    """Rotate [T,H,D] indexer states with Qwen interleaved M-RoPE."""
++    import torch
++    rows=rotary_rows(cos_sin,positions)
++    half=rows.shape[-1]//2
++    cos,sin=rows[:,:half,None].transpose(1,2),rows[:,half:,None].transpose(1,2)
++    a=x[...,:half].float();b=x[...,half:2*half].float()
++    rotated=torch.cat((a*cos-b*sin,b*cos+a*sin),dim=-1).to(x.dtype)
++    return torch.cat((rotated,x[...,2*half:]),dim=-1)

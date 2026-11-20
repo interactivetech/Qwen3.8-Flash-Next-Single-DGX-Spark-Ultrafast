@@ -1,0 +1,20 @@
+Qwen3.8-Flash-Next with image input on one DGX Spark (Hibana)
+
+This recipe builds on two projects:
+
+1. dedene/Hibana-Qwen3.8-Flash-Next-DGX-Spark (https://github.com/dedene/Hibana-Qwen3.8-Flash-Next-DGX-Spark),
+   commit 6948e9b, MIT License, Copyright (c) 2026 Peter Dedene. The Dockerfile, compose.yaml, tools/download.sh,
+   tools/serve.sh, tools/check.py and patches/0001-tool-args-anyof.patch come from it. This recipe changes
+   compose.yaml, tools/serve.sh, tools/check.py, .env.example and the Dockerfile.
+
+2. Hibana (https://github.com/sharar-project/hibana), commit d474b74, Apache License 2.0, by Yahya Emara,
+   Chi-Chih Chang and the Abdelfattah Lab at Cornell. Hibana is downloaded and built inside the image; it is not
+   copied into this repository.
+
+   patches/0002-flashnext-vision.patch and patches/0003-vision-speculation-graphs.patch modify Hibana source files.
+   As required by section 4(b) of the Apache License 2.0: these patches change files under hibana/ (api/, engine/,
+   model/ and proposers/; each patch lists the files it touches). The modified files stay under the Apache
+   License 2.0. The patches are offered under the same license.
+
+The model weights are not part of this repository. Qwen3.8-Flash-Next is by the Qwen team; the NVFP4 checkpoint is
+by RadixArk; Hibana's 3-bit copies are by the Hibana authors. Each carries its own license on its model card.
