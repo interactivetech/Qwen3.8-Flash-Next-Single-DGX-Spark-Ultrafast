@@ -19,6 +19,11 @@ port 8888, thinking and tool calls included.
 
 [![This recipe running an agentic coding task in DeepSeek Harness: reasoning, tool calls and code streaming in real time](media/dsh-agentic-demo.gif)](media/dsh-agentic-demo.mp4)
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="media/speed-chart-dark.png">
+  <img alt="Bar chart: this recipe streams 101.3 tok/s on English prose vs 46.6 for a typical recipe, 133.3 vs 58.3 on code, 101.8 on prose about an image, and 252.9 vs 97.3 total with 4 requests at once" src="media/speed-chart-light.png">
+</picture>
+
 | tok/s, one DGX Spark | Typical recipe (TensorFold, NVFP4 + MTP) | Hibana `exact` | **This recipe** (Hibana `fast` + images) |
 |---|---:|---:|---:|
 | English prose, 1 request | 46.6 | 45.2 | **101.3** |
@@ -124,6 +129,11 @@ Put overrides in `.env` (see `.env.example`).
 | `HIBANA_IMAGE` | `hibana-flashnext-vision:d474b74d-v1` | Engine image tag |
 
 ## Quality and limits
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="media/quality-chart-dark.png">
+  <img alt="Quality panels: GPQA-Diamond 81.8% fast vs 84.8% exact (p 0.51); BFCL 87.2 fast vs 85.8 TensorFold; AgentDojo 77.5 vs 85.5; injection attacks executed 1 of 200 for both" src="media/quality-chart-light.png">
+</picture>
 
 - **`fast` is slightly lossy.** Hibana's authors measured GPQA-Diamond with thinking at 81.8% in `fast` against 84.8% in
   `exact` (99 questions, p 0.51), with answers 18% longer. dedene's agent benchmark on `fast`: BFCL single-turn 87.2

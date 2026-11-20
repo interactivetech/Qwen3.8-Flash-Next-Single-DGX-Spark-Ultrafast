@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speed on one DGX Spark: this recipe vs typical setups</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='2' y='8' width='3' height='6' rx='1' fill='%238a8984'/><rect x='6.5' y='5' width='3' height='9' rx='1' fill='%23eb6834'/><rect x='11' y='2' width='3' height='12' rx='1' fill='%232a78d6'/></svg>">
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --surface-2: #f3f2ef;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #73726c;
+    --grid: #e6e5e0;
+    --axis: #c9c8c2;
+    --typical: #c3c2bb;
+    --exact: #8f8e88;
+    --fast: #2a78d6;
+    --sampled: #eb6834;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --surface-2: #242423;
+      --text-primary: #f0efec;
+      --text-secondary: #c3c2b7;
+      --text-muted: #9a998f;
+      --grid: #2e2e2c;
+      --axis: #4a4945;
+      --typical: #4f4e4a;
+      --exact: #7a7973;
+      --fast: #3987e5;
+      --sampled: #d95926;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --surface-2: #242423;
+    --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #9a998f;
+    --grid: #2e2e2c; --axis: #4a4945;
+    --typical: #4f4e4a; --exact: #7a7973; --fast: #3987e5; --sampled: #d95926;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { background: #fcfcfb; }
+  @media (prefers-color-scheme: dark) { :root:where(:not([data-theme="light"])) body { background: #1a1a19; } }
+  :root[data-theme="dark"] body { background: #1a1a19; }
+  .viz-root {
+    background: var(--surface-1);
+    color: var(--text-primary);
+    font-family: ui-sans-serif, -apple-system, "SF Pro Text", "Segoe UI", "Helvetica Neue", sans-serif;
+    font-size: 16px;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 40px 40px 32px;
+    font-variant-numeric: tabular-nums;
+  }
+  h1 { font-size: 1.6rem; line-height: 1.25; margin: 0 0 6px; font-weight: 650; letter-spacing: -0.01em; }
+  .sub { color: var(--text-secondary); margin: 0 0 22px; font-size: 1rem; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 0 0 10px; padding: 0; list-style: none; font-size: 0.875rem; color: var(--text-secondary); }
+  .legend li { display: flex; align-items: center; gap: 8px; }
+  .legend .sw { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  .legend b { color: var(--text-primary); font-weight: 600; }
+  .chart { position: relative; }
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .tick { fill: var(--text-muted); font-size: 12px; }
+  .val { fill: var(--text-secondary); font-size: 12px; text-anchor: middle; }
+  .val.hero { fill: var(--text-primary); font-size: 13px; font-weight: 650; }
+  .grp { fill: var(--text-primary); font-size: 14px; font-weight: 600; text-anchor: middle; }
+  .mult { fill: var(--text-secondary); font-size: 13px; text-anchor: middle; }
+  .na { fill: var(--text-muted); font-size: 12px; text-anchor: middle; }
+  .hit { fill: transparent; cursor: default; }
+  .bar { transition: opacity .12s; }
+  .chart.hovering .bar { opacity: .35; }
+  .chart.hovering .bar.on { opacity: 1; }
+  .tip {
+    position: absolute; pointer-events: none; opacity: 0; transition: opacity .1s;
+    background: var(--surface-2); color: var(--text-primary);
+    border: 1px solid var(--axis); border-radius: 8px; padding: 8px 10px;
+    font-size: 0.8125rem; line-height: 1.4; white-space: nowrap;
+    box-shadow: 0 4px 16px rgb(0 0 0 / .12);
+  }
+  .tip .k { display: flex; align-items: center; gap: 6px; color: var(--text-secondary); }
+  .tip .k i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .tip .v { font-size: 1rem; font-weight: 650; }
+  .foot { color: var(--text-muted); font-size: 0.8125rem; margin: 14px 0 0; line-height: 1.5; }
+  details { margin-top: 14px; font-size: 0.875rem; color: var(--text-secondary); }
+  summary { cursor: pointer; }
+  table { border-collapse: collapse; margin-top: 10px; }
+  th, td { padding: 6px 12px; border-bottom: 1px solid var(--grid); text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--text-primary); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="viz-root">
+  <h1>This recipe streams 2.2× faster than a typical Flash-Next setup</h1>
+  <p class="sub">Output tokens per second, Qwen3.8-Flash-Next on one DGX Spark. Higher is better.</p>
+
+  <ul class="legend" aria-label="Legend">
+    <li><span class="sw" style="background:var(--typical)"></span>Typical recipe (TensorFold, NVFP4 + MTP)</li>
+    <li><span class="sw" style="background:var(--exact)"></span>Hibana <code>exact</code></li>
+    <li><span class="sw" style="background:var(--fast)"></span><b>This recipe</b> (Hibana <code>fast</code> + images)</li>
+    <li><span class="sw" style="background:var(--sampled)"></span>This recipe, sampled (temperature 1.0)</li>
+  </ul>
+
+  <div class="chart" id="chart">
+    <svg id="svg" viewBox="0 0 1100 470" role="img" aria-label="Grouped bar chart of tokens per second. English prose: typical 46.6, Hibana exact 45.2, this recipe 101.3, sampled 82.2. Code: 58.3, 50.7, 133.3, 114.3. Prose about an image: typical and exact have no image input, this recipe 101.8, sampled 84.5. Four requests at once, total: 97.3, 96.6, 252.9, 204.2."></svg>
+    <div class="tip" id="tip"></div>
+  </div>
+
+  <p class="foot">One request at a time unless noted; the last group is total throughput with 4 requests at once. Greedy decoding except the sampled bars. Multipliers compare this recipe with the typical recipe. Data: <code>bench/results.json</code>.</p>
+
+  <details>
+    <summary>Table view</summary>
+    <table id="tbl"></table>
+  </details>
+</div>
+<script>
+const SERIES = [
+  { key: 'typical', name: 'Typical recipe (TensorFold, NVFP4 + MTP)' },
+  { key: 'exact',   name: 'Hibana exact' },
+  { key: 'fast',    name: 'This recipe (Hibana fast + images)', hero: true },
+  { key: 'sampled', name: 'This recipe, sampled (temperature 1.0)' },
+];
+const GROUPS = [
+  { name: 'English prose',          v: [46.6, 45.2, 101.3, 82.2] },
+  { name: 'Code',                   v: [58.3, 50.7, 133.3, 114.3] },
+  { name: 'Prose about an image',   v: [null, null, 101.8, 84.5] },
+  { name: '4 requests at once, total', v: [97.3, 96.6, 252.9, 204.2] },
+];
+const W = 1100, H = 470, M = { t: 34, r: 8, b: 74, l: 46 };
+const PW = W - M.l - M.r, PH = H - M.t - M.b;
+const YMAX = 275, TICKS = [0, 50, 100, 150, 200, 250];
+const BAR = 24, GAP = 14;
+const y = v => M.t + PH - (v / YMAX) * PH;
+const NS = 'http://www.w3.org/2000/svg';
+const svg = document.getElementById('svg');
+const el = (tag, attrs, text) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; svg.appendChild(e); return e; };
+
+// Grid + y ticks
+for (const t of TICKS) {
+  el('line', { x1: M.l, x2: W - M.r, y1: y(t), y2: y(t), stroke: t === 0 ? 'var(--axis)' : 'var(--grid)', 'stroke-width': 1, 'shape-rendering': 'crispEdges' });
+  el('text', { x: M.l - 10, y: y(t) + 4, class: 'tick', 'text-anchor': 'end' }, t);
+}
+el('text', { x: M.l - 10, y: M.t - 16, class: 'tick', 'text-anchor': 'end' }, 'tok/s');
+
+// Rounded-top bar path: 4px radius at the data end, square at the baseline
+const barPath = (x, top, w, base) => {
+  const r = Math.min(4, (base - top) / 2);
+  return `M${x},${base}V${top + r}Q${x},${top} ${x + r},${top}H${x + w - r}Q${x + w},${top} ${x + w},${top + r}V${base}Z`;
+};
+
+const bandW = PW / GROUPS.length;
+const groupW = SERIES.length * BAR + (SERIES.length - 1) * GAP;
+const bars = [];
+GROUPS.forEach((g, gi) => {
+  const x0 = M.l + gi * bandW + (bandW - groupW) / 2;
+  const cx = M.l + gi * bandW + bandW / 2;
+  g.v.forEach((v, si) => {
+    const x = x0 + si * (BAR + GAP);
+    if (v == null) return;
+    const s = SERIES[si];
+    const p = el('path', { d: barPath(x, y(v), BAR, y(0) - 1), fill: `var(--${s.key})`, class: 'bar' });
+    el('text', { x: x + BAR / 2, y: y(v) - 8, class: 'val' + (s.hero ? ' hero' : '') }, v.toFixed(1));
+    const hit = el('rect', { x: x - GAP / 2, y: M.t, width: BAR + GAP, height: PH, class: 'hit' });
+    bars.push({ p, hit, g, s, v, gi, si });
+  });
+  // Missing comparators in the image group
+  if (g.v[0] == null) {
+    const nx = x0 + (2 * BAR + GAP) / 2;
+    el('text', { x: nx, y: y(0) - 26, class: 'na' }, 'no image');
+    el('text', { x: nx, y: y(0) - 10, class: 'na' }, 'input');
+  }
+  el('text', { x: cx, y: y(0) + 26, class: 'grp' }, g.name);
+  const base = g.v[0];
+  el('text', { x: cx, y: y(0) + 46, class: 'mult' }, base ? `${(g.v[2] / base).toFixed(1)}× typical` : 'image input only here');
+});
+
+// Hover
+const chart = document.getElementById('chart'), tip = document.getElementById('tip');
+for (const b of bars) {
+  b.hit.addEventListener('mouseenter', () => {
+    chart.classList.add('hovering'); b.p.classList.add('on');
+    const base = b.g.v[0];
+    const mult = base && b.si > 0 ? `<div>${(b.v / base).toFixed(2)}× typical</div>` : '';
+    tip.innerHTML = `<div class="k"><i style="background:var(--${b.s.key})"></i>${b.s.name}</div><div>${b.g.name}</div><div class="v">${b.v.toFixed(1)} tok/s</div>${mult}`;
+    tip.style.opacity = 1;
+  });
+  b.hit.addEventListener('mousemove', e => {
+    const r = chart.getBoundingClientRect();
+    let left = e.clientX - r.left + 14, top = e.clientY - r.top - 10;
+    if (left + tip.offsetWidth > r.width) left = e.clientX - r.left - tip.offsetWidth - 14;
+    tip.style.left = left + 'px'; tip.style.top = top + 'px';
+  });
+  b.hit.addEventListener('mouseleave', () => { chart.classList.remove('hovering'); b.p.classList.remove('on'); tip.style.opacity = 0; });
+}
+
+// Table view
+const tbl = document.getElementById('tbl');
+tbl.innerHTML = '<tr><th>tok/s</th>' + SERIES.map(s => `<th>${s.name}</th>`).join('') + '</tr>' +
+  GROUPS.map(g => `<tr><td>${g.name}</td>` + g.v.map(v => `<td>${v == null ? 'no images' : v.toFixed(1)}</td>`).join('') + '</tr>').join('');
+</script>
+</body>
+</html>

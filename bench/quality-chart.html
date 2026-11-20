@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quality: Hibana fast against exact and a typical recipe</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='3' y='3' width='4' height='11' rx='1' fill='%232a78d6'/><rect x='9' y='4' width='4' height='10' rx='1' fill='%238f8e88'/></svg>">
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #73726c;
+    --grid: #e6e5e0;
+    --axis: #c9c8c2;
+    --dot-off: #e2e1dc;
+    --typical: #c3c2bb;
+    --exact: #8f8e88;
+    --fast: #2a78d6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1: #1a1a19; --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #9a998f;
+      --grid: #2e2e2c; --axis: #4a4945; --dot-off: #33332f;
+      --typical: #4f4e4a; --exact: #7a7973; --fast: #3987e5;
+    }
+    :root:where(:not([data-theme="light"])) body { background: #1a1a19; }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #9a998f;
+    --grid: #2e2e2c; --axis: #4a4945; --dot-off: #33332f;
+    --typical: #4f4e4a; --exact: #7a7973; --fast: #3987e5;
+  }
+  :root[data-theme="dark"] body { background: #1a1a19; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { background: #fcfcfb; }
+  .viz-root {
+    background: var(--surface-1); color: var(--text-primary);
+    font-family: ui-sans-serif, -apple-system, "SF Pro Text", "Segoe UI", "Helvetica Neue", sans-serif;
+    font-size: 16px; max-width: 1180px; margin: 0 auto; padding: 40px 40px 32px;
+    font-variant-numeric: tabular-nums;
+  }
+  h1 { font-size: 1.6rem; line-height: 1.25; margin: 0 0 6px; font-weight: 650; letter-spacing: -0.01em; }
+  .sub { color: var(--text-secondary); margin: 0 0 22px; font-size: 1rem; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 0 0 18px; padding: 0; list-style: none; font-size: 0.875rem; color: var(--text-secondary); }
+  .legend li { display: flex; align-items: center; gap: 8px; }
+  .legend .sw { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  .legend b { color: var(--text-primary); font-weight: 600; }
+  svg { display: block; width: 100%; height: auto; }
+  .ptitle { fill: var(--text-primary); font-size: 15px; font-weight: 650; }
+  .pnote { fill: var(--text-secondary); font-size: 12.5px; }
+  .tick { fill: var(--text-muted); font-size: 12px; }
+  .val { fill: var(--text-secondary); font-size: 13px; text-anchor: middle; }
+  .val.hero { fill: var(--text-primary); font-weight: 650; font-size: 14px; }
+  .blab { fill: var(--text-secondary); font-size: 12.5px; text-anchor: middle; }
+  .delta { font-size: 13.5px; font-weight: 650; fill: var(--text-primary); }
+  .dnote { font-size: 12.5px; fill: var(--text-muted); }
+  .big { fill: var(--text-primary); font-size: 30px; font-weight: 650; }
+  .foot { color: var(--text-muted); font-size: 0.8125rem; margin: 16px 0 0; line-height: 1.5; }
+  details { margin-top: 12px; font-size: 0.875rem; color: var(--text-secondary); }
+  summary { cursor: pointer; }
+  table { border-collapse: collapse; margin-top: 10px; }
+  th, td { padding: 6px 12px; border-bottom: 1px solid var(--grid); text-align: left; }
+  td.n { text-align: right; }
+  th { color: var(--text-primary); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="viz-root">
+  <h1><code>fast</code> mode costs a little accuracy for 2.2× speed</h1>
+  <p class="sub">Each panel compares Hibana <code>fast</code> (this recipe's decoding) with the setup it was measured against.</p>
+
+  <ul class="legend" aria-label="Legend">
+    <li><span class="sw" style="background:var(--fast)"></span><b>Hibana <code>fast</code></b> (this recipe)</li>
+    <li><span class="sw" style="background:var(--exact)"></span>Hibana <code>exact</code> (the model's exact outputs)</li>
+    <li><span class="sw" style="background:var(--typical)"></span>Typical recipe (TensorFold, NVFP4 + MTP)</li>
+  </ul>
+
+  <svg id="svg" viewBox="0 0 1100 420" role="img" aria-label="Four panels. GPQA-Diamond with thinking: fast 81.8%, exact 84.8%, a 3.0-point gap that is not statistically significant (p 0.51, 99 questions). BFCL single-turn tool calls: fast 87.2, TensorFold 85.8. AgentDojo tasks completed under attack: fast 77.5, TensorFold 85.5. Prompt-injection attacks executed: 1 of 200 for both."></svg>
+
+  <p class="foot">Measured on Hibana's <code>fast</code> profile by others, not re-run on this build. GPQA-Diamond: Hibana's authors, thinking up to 64K tokens, 99 paired questions; <code>fast</code> answers were 18% longer. BFCL, AgentDojo and injection attacks: dedene's agent benchmark. Higher is better except the last panel.</p>
+
+  <details>
+    <summary>Table view</summary>
+    <table id="tbl"></table>
+  </details>
+</div>
+<script>
+const PANELS = [
+  { title: 'GPQA-Diamond', note: 'hard science Q&A with thinking, % correct', unit: '%',
+    bars: [{ k: 'fast', label: 'fast', v: 81.8 }, { k: 'exact', label: 'exact', v: 84.8 }],
+    delta: '−3.0 pts', dnote: 'not significant (p 0.51)' },
+  { title: 'BFCL single-turn', note: 'tool-call accuracy, score', unit: '',
+    bars: [{ k: 'fast', label: 'fast', v: 87.2 }, { k: 'typical', label: 'TensorFold', v: 85.8 }],
+    delta: '+1.4 pts', dnote: 'vs typical recipe' },
+  { title: 'AgentDojo', note: 'agent tasks done under attack, score', unit: '',
+    bars: [{ k: 'fast', label: 'fast', v: 77.5 }, { k: 'typical', label: 'TensorFold', v: 85.5 }],
+    delta: '−8.0 pts', dnote: 'vs typical recipe' },
+  { title: 'Injection attacks executed', note: 'out of 200 · lower is better', waffle: true,
+    bars: [{ k: 'fast', label: 'fast', v: 1 }, { k: 'typical', label: 'TensorFold', v: 1 }],
+    delta: 'Same', dnote: '1 of 200 each' },
+];
+const NS = 'http://www.w3.org/2000/svg', svg = document.getElementById('svg');
+const el = (tag, a, text, parent = svg) => { const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); if (text != null) e.textContent = text; parent.appendChild(e); return e; };
+const W = 1100, PW = 255, PG = (W - 4 * PW) / 3;
+const TOP = 70, base = 330, ph = base - TOP;
+const y = v => base - (v / 100) * ph;
+const barPath = (x, t, w, b) => { const r = Math.min(4, (b - t) / 2); return `M${x},${b}V${t + r}Q${x},${t} ${x + r},${t}H${x + w - r}Q${x + w},${t} ${x + w},${t + r}V${b}Z`; };
+
+PANELS.forEach((p, i) => {
+  const x0 = i * (PW + PG);
+  el('text', { x: x0, y: 18, class: 'ptitle' }, p.title);
+  el('text', { x: x0, y: 38, class: 'pnote' }, p.note);
+  if (!p.waffle) {
+    for (const t of [0, 25, 50, 75, 100]) {
+      el('line', { x1: x0 + 30, x2: x0 + PW, y1: y(t), y2: y(t), stroke: t ? 'var(--grid)' : 'var(--axis)', 'stroke-width': 1, 'shape-rendering': 'crispEdges' });
+      el('text', { x: x0 + 22, y: y(t) + 4, class: 'tick', 'text-anchor': 'end' }, t);
+    }
+    const BW = 56, cx = x0 + 30 + (PW - 30) / 2;
+    p.bars.forEach((b, j) => {
+      const bx = cx + (j === 0 ? -BW - 14 : 14);
+      const path = el('path', { d: barPath(bx, y(b.v), BW, base - 1), fill: `var(--${b.k})` });
+      el('title', {}, `${b.label}: ${b.v}${p.unit}`, path);
+      el('text', { x: bx + BW / 2, y: y(b.v) - 8, class: 'val' + (j === 0 ? ' hero' : '') }, b.v.toFixed(1) + p.unit);
+      el('text', { x: bx + BW / 2, y: base + 20, class: 'blab' }, b.label);
+    });
+  } else {
+    // Two 20 x 10 dot grids: 200 attacks each, executed ones filled
+    const R = 4, STEP = 10.6, gw = 10 * STEP;
+    p.bars.forEach((b, j) => {
+      const gx = x0 + 4 + j * (gw + 24), gy = TOP + 8;
+      for (let n = 0; n < 200; n++) {
+        const c = n % 10, r = Math.floor(n / 10);
+        const hit = n >= 200 - b.v;
+        el('circle', hit
+          ? { cx: gx + c * STEP + R, cy: gy + r * STEP + R, r: R + 0.8, fill: `var(--${b.k})`, stroke: 'var(--text-primary)', 'stroke-width': 1.2 }
+          : { cx: gx + c * STEP + R, cy: gy + r * STEP + R, r: R - 0.6, fill: 'none', stroke: 'var(--axis)', 'stroke-width': 1 });
+      }
+      el('text', { x: gx + gw / 2, y: base + 20, class: 'blab' }, b.label);
+    });
+  }
+  const d = el('text', { x: x0, y: base + 52, class: 'delta' }, p.delta);
+  el('text', { x: x0 + d.getComputedTextLength() + 8, y: base + 52, class: 'dnote' }, p.dnote);
+});
+
+const tbl = document.getElementById('tbl');
+tbl.innerHTML = '<tr><th>Benchmark</th><th>Hibana fast</th><th>Compared with</th><th>Their score</th></tr>' +
+  PANELS.map(p => `<tr><td>${p.title}</td><td class="n">${p.waffle ? '1 of 200' : p.bars[0].v + p.unit}</td><td>${p.bars[1].label === 'exact' ? 'Hibana exact' : 'TensorFold'}</td><td class="n">${p.waffle ? '1 of 200' : p.bars[1].v + p.unit}</td></tr>`).join('');
+</script>
+</body>
+</html>
