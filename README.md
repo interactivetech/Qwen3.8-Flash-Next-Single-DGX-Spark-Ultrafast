@@ -1,8 +1,5 @@
-<h1 align="center">Qwen3.8-Flash-Next at 100+ tok/s on one DGX Spark</h1>
-
 <p align="center">
-  <b>~101 tok/s prose · ~133 tok/s code · ~102 tok/s with images · ~250 tok/s across 4 requests</b><br>
-  About 2× a typical Flash-Next setup on the Spark. One <code>docker compose up</code>.
+  <img alt="Qwen3.8-Flash-Next on one NVIDIA DGX Spark: 101 tok/s on prose, 2.2× the typical Flash-Next setup on the same box. 133 tok/s on code, 253 tok/s total across 4 requests, about 3,300 tok/s prefill at 8K–32K. Bar chart of decode speed against the typical recipe (TensorFold, NVFP4 + MTP): prose 101.3 vs 46.6, code 133.3 vs 58.3, 4 requests 252.9 vs 97.3." src="media/header.png">
 </p>
 
 <p align="center">
