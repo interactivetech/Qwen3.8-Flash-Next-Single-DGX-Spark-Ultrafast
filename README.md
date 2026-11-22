@@ -6,6 +6,10 @@
   <a href="#quickstart">Quickstart</a> · <a href="#speed">Speed</a> · <a href="#quality-and-limits">Quality</a> · <a href="docs/optimization-notes.md">Optimization notes</a> · <a href="https://github.com/dedene/Hibana-Qwen3.8-Flash-Next-DGX-Spark">Built on dedene's recipe</a>
 </p>
 
+<p align="center">
+  <a href="https://x.com/iamprestonlogan"><img alt="Follow @iamprestonlogan on X" src="https://img.shields.io/badge/Follow-%40iamprestonlogan-000000?style=for-the-badge&logo=x&logoColor=white"></a>
+</p>
+
 Most Qwen3.8-Flash-Next recipes reach ~45–50 tok/s on a Spark (vLLM/SGLang/TensorFold with NVFP4 + MTP). This one runs
 [Hibana](https://github.com/sharar-project/hibana), Cornell's GB10 inference engine, in its `fast` profile,
 and adds **image input** for Flash-Next, which upstream Hibana does not load. OpenAI- and Anthropic-compatible API on
