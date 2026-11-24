@@ -101,6 +101,38 @@ Thinking is on by default, as on the model card. A request turns it off with
 `chat_template_kwargs.enable_thinking: false`. Reasoning comes back in `reasoning_content`. Any `model` id works.
 Anthropic-style `image` blocks with a base64 source work too.
 
+## Authenticated Apache deployment
+
+For a Spark with an Apache reverse proxy on port 8000, keep Hibana private by
+setting these overrides in the ignored `.env` file:
+
+```dotenv
+HOST=127.0.0.1
+PORT=8888
+RESTART=unless-stopped
+```
+
+Build and start with `docker compose up -d --wait`. Verify the backend with
+`tools/check.py` before changing the proxy. Set Apache's `ProxyPass` and
+`ProxyPassReverse` targets to `http://127.0.0.1:8888/`; enforce Bearer authentication
+for every path. Back up the proxy configuration, validate it with `apache2 -t -f
+/path/to/apache.conf`, then gracefully reload the instance using that same config.
+Keep long proxy timeouts and verify that SSE responses stream incrementally.
+
+Clients use `http://<spark-ip>:8000/v1` as their OpenAI base URL and the configured
+proxy key as their API key. Run the checks through the proxy using:
+
+```bash
+read -rs -p 'Proxy API key: ' HIBANA_API_KEY; echo
+export HIBANA_API_KEY
+tools/check.py --url http://127.0.0.1:8000
+unset HIBANA_API_KEY
+```
+
+Missing or incorrect keys must return HTTP 401. Port 8888 must listen only on
+loopback. `HIBANA_API_KEY` authenticates the check client; it does not add
+server-side authentication to Hibana. Use the proxy for remote access.
+
 ## What this repo adds to dedene's recipe
 
 | | dedene's recipe | This recipe |

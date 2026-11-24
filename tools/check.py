@@ -26,10 +26,14 @@ import struct
 class Server:
     def __init__(self, url: str, model: str):
         self.base, self.model = url.rstrip("/"), model
+        self.api_key = os.environ.get("HIBANA_API_KEY", "")
 
     def _open(self, path: str, body: dict | None = None):
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(self.base + path, data, {"Content-Type": "application/json"})
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(self.base + path, data, headers)
         try:
             return urllib.request.urlopen(req, timeout=3600)
         except urllib.error.HTTPError as err:
